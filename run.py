@@ -221,10 +221,16 @@ class GRUNet(torch.nn.Module):
 def sisdr(estimate: torch.Tensor, target: torch.Tensor,
           reduction: Optional[str] = None):
     """Calculate single source SI-SDR."""
-    if isinstance(estimate, np.ndarray):
-        estimate = torch.from_numpy(estimate)
-    if isinstance(target, np.ndarray):
-        target = torch.from_numpy(target)
+    def _fix(signal):
+        if isinstance(signal, np.ndarray):
+            signal = torch.from_numpy(signal)
+        if len(signal.shape) < 2:
+            signal = signal.unsqueeze(0)
+        if len(signal.shape) > 2:
+            signal = signal.squeeze(-2)
+        return signal
+    ml = min(estimate.shape[-1], target.shape[-1])
+    estimate, target = _fix(estimate)[..., :ml], _fix(target)[..., :ml]
     output = -1 * singlesrc_neg_sisdr(estimate, target)
     if reduction == 'mean':
         output = torch.mean(output)
@@ -233,13 +239,8 @@ def sisdr(estimate: torch.Tensor, target: torch.Tensor,
 
 def sisdr_improvement(estimate: torch.Tensor, target: torch.Tensor,
                       mixture: torch.Tensor, reduction: Optional[str] = None):
-    """Calculate estimate to target SI-SDR improvement relative to mixture."""
-    if isinstance(estimate, np.ndarray):
-        estimate = torch.from_numpy(estimate)
-    if isinstance(target, np.ndarray):
-        target = torch.from_numpy(target)
-    if isinstance(mixture, np.ndarray):
-        mixture = torch.from_numpy(mixture)
+    """Calculate estimate to target SI-SDR improvement relative to mixture.
+    """
     output = sisdr(estimate, target) - sisdr(estimate, mixture)
     if reduction == 'mean':
         output = torch.mean(output)
@@ -413,6 +414,17 @@ def load_librispeech(dataset_directory: Union[str, os.PathLike] = _root_librispe
     else:
         df = pd.read_csv(dataset_directory.joinpath('dataframe.csv'))
 
+    # discard recordings from speakers who possess clipped recordings
+    # (manually found using SoX, where 'volume adjustment' == 1.000)
+    clipped_speakers = [ '101', '1069', '1175', '118', '1290', '1379', '1456',
+        '1552', '1578', '1629', '1754', '1933', '1943', '1963', '198', '204',
+        '2094', '2113', '2149', '22', '2269', '2618', '2751', '307', '3168',
+        '323', '3294', '3374', '345', '3486', '3490', '3615', '3738', '380',
+        '4148', '446', '459', '4734', '481', '5002', '5012', '5333', '549',
+        '5561', '5588', '559', '5678', '5740', '576', '593', '6295', '6673',
+        '7139', '716', '7434', '7800', '781', '8329', '8347', '882' ]
+    df = df[~df['speaker_id'].isin(clipped_speakers)]
+
     # omit recordings which are smaller than an example
     df = df.query('duration >= @_example_duration')
 
@@ -550,20 +562,165 @@ def count_parameters(network: torch.nn.Module):
     )
 
 
-@torch.no_grad()
-def test_model(network: torch.nn.Module, scenario: str):
-
-    # fix the random seed for everything
-    R = lambda: np.random.default_rng(0)
+def get_personalized_dataset(
+    test_speaker: Union[int, str],
+    environment_snr_db: Union[float, Tuple[float, float]],
+    num_environments: int = 1):
 
     # build test set
+    rng = np.random.default_rng(0)
+
+    # retrieve datasets
     S_te = load_librispeech().query('subset_id == "test-clean"')
-    test_speakers = S_te.speaker_id.unique()
+    S_te = S_te[['speaker_id', 'filepath', 'duration']]
+    test_speakers = S_te['speaker_id'].astype(str).unique()
+    test_speaker = str(test_speaker)
+    if test_speaker not in test_speakers:
+        raise ValueError(f'Invalid test speaker ID: {test_speaker}.')
     M = load_demand()
 
-    raise NotImplementedError
+    # map each speaker to one or multiple environments
+    if num_environments < 1 or not isinstance(num_environments, int):
+        raise ValueError('Expected non-zero integer number of environments.')
+    elif num_environments > len(M):
+        raise ValueError(f'Maximum test-time environments is {len(M)}.')
+    elif num_environments == 1:
+        test_envs = rng.permutation(len(test_speakers)) % len(M)
+        env_mapping = {k: v for (k, v) in zip(test_speakers, test_envs)}
+    else:
+        n = num_environments
+        test_envs = [rng.choice(len(M), n, replace=False)
+                     for _ in range(len(test_speakers))]
+        env_mapping = {k: list(test_envs[i])
+                       for (i, k) in enumerate(test_speakers)}
 
-    return sisdri_te
+    # each test speaker in LibriSpeech has at least 300 seconds
+    # of utterance data to work with. split their data as follows:
+    # - test set = 30 seconds
+    # - validation set = 30 seconds
+    # - finetune set = 60 seconds
+    # - train set = remainder
+    utterance_list = S_te.query('speaker_id == @test_speaker')
+    utterance_list = utterance_list.sort_values('duration').reset_index()
+    utterance_list['cumsum'] = utterance_list['duration'].cumsum()
+    split_te = (utterance_list['cumsum']-30).abs().idxmin()
+    split_vl = (utterance_list['cumsum']-60).abs().idxmin()
+    split_ft = (utterance_list['cumsum']-120).abs().idxmin()
+    u_te = utterance_list.iloc[0:split_te]
+    u_vl = utterance_list.iloc[split_te:split_vl]
+    u_ft = utterance_list.iloc[split_vl:split_ft]
+    u_tr = utterance_list.iloc[split_ft:]
+
+    # load all the speaker audio and concatenate it into a
+    # single long vector
+    s_te = np.concatenate([wav_read(f) for f in u_te.filepath])
+    s_vl = np.concatenate([wav_read(f) for f in u_vl.filepath])
+    s_ft = np.concatenate([wav_read(f) for f in u_ft.filepath])
+    s_tr = np.concatenate([wav_read(f) for f in u_tr.filepath])
+    s = np.concatenate([s_te, s_vl, s_ft, s_tr])
+
+    # load the premixture noise profile
+    env_indices = env_mapping[test_speaker]
+    if num_environments == 1:
+        p = wav_read(M.iloc[env_indices]['filepath'])
+    else:
+        p = np.stack([wav_read(f) for f in
+                      M.iloc[env_indices]['filepath']])
+
+    # segment the premixture noise similarly
+    split_te = len(s_te)
+    split_vl = split_te + len(s_vl)
+    split_ft = split_vl + len(s_ft)
+    p_te = p[..., 0:split_te]
+    p_vl = p[..., split_te:split_vl]
+    p_ft = p[..., split_vl:split_ft]
+    p_tr = p[..., split_ft:]
+
+    # circularly loop the training premixture noise if it is
+    # too short
+    tile_count = -(-s_tr.shape[-1]//p_tr.shape[-1])
+    if num_environments == 1:
+        p_tr = np.tile(p_tr, tile_count)
+    else:
+        p_tr = np.tile(p_tr, (1, tile_count))
+    p_tr = p_tr[..., :len(s_tr)]
+    p = np.concatenate([p_te, p_vl, p_ft, p_tr], axis=-1)
+
+    # get the correct mixing scalar based on the overall
+    # energies of the speech and premixture datasets
+    energy_s = np.sum(s**2, axis=-1, keepdims=True)
+    energy_n = np.sum(p**2, axis=-1, keepdims=True)
+    snr_db = np.mean(environment_snr_db)
+    b = np.sqrt((energy_s/energy_n)*(10**(-snr_db/10.)))
+
+    # combine all the signals
+    x_te = s_te + b*p_te
+
+    return {
+        'train_speech': s_tr,
+        'train_prenoise': p_tr,
+        'finetune_speech': s_ft,
+        'val_speech': s_vl,
+        'val_prenoise': p_vl,
+        'test_speech': s_te,
+        'test_prenoise': p_te,
+        'test_premixture': x_te,
+        'environments': {i: j for (i, j) in enumerate(
+            M.iloc[env_indices]['location_id'])}
+    }
+
+
+@torch.no_grad()
+def test_model(
+    model: torch.nn.Module,
+    test_speaker: Optional[Union[int, str]] = None,
+    environment_snr_db: Union[float, Tuple[float, float]] = 0,
+    num_environments: int = 1):
+    """Evaluates a speech enhancement model on one or many test set speakers.
+    """
+    def _run_test(model, test_speaker, environment_snr_db, num_environments):
+        dataset = get_personalized_dataset(
+            test_speaker, environment_snr_db, num_environments)
+        s_te = torch.from_numpy(dataset['test_speech']
+            ).float().flatten().unsqueeze(0).cuda()
+        x_te = torch.from_numpy(dataset['test_premixture']
+            ).float().flatten().unsqueeze(0).cuda()
+        s_hat_te = model(x_te)
+        return float(sisdr_improvement(s_hat_te, s_te, x_te).mean())
+
+    if test_speaker == None:
+        S_te = load_librispeech().query('subset_id == "test-clean"')
+        S_te = S_te[['speaker_id', 'filepath', 'duration']]
+        test_speakers = sorted(S_te['speaker_id'].astype(str).unique())
+    else:
+        test_speakers = [test_speaker]
+
+    return {
+        k: _run_test(model, k, environment_snr_db, num_environments)
+        for k in test_speakers
+    }
+
+
+@torch.no_grad()
+def test_checkpoint(
+    checkpoint_path: Union[str, os.PathLike],
+    test_speaker: Optional[Union[int, str]] = None,
+    environment_snr_db: Union[float, Tuple[float, float]] = 0,
+    num_environments: int = 1):
+    """
+    """
+    # load a config yaml file which should be in the same location
+    yaml_file = pathlib.Path(checkpoint_path).with_name('config.yaml')
+    if not yaml_file.exists():
+        raise ValueError(f'Could not find {str(yaml_file)}.')
+    with open(yaml_file, 'r') as fp:
+        config = yaml.load(fp, Loader=yaml.FullLoader)
+    model, _ = init_model(config)
+    checkpoint_obj = torch.load(checkpoint_path)
+    model_state_dict = checkpoint_obj['model_state_dict']
+    model.load_state_dict(model_state_dict, strict=True)
+    model.cuda()
+    return test_model(model, test_speaker, environment_snr_db, num_environments)
 
 
 def train_sup(config: dict, checkpoint_path: Optional[str] = None):
