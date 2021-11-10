@@ -26,12 +26,13 @@ _hop_size: int = 256
 _window = torch.hann_window(_fft_size)
 _eps: float = 1e-8
 _batch_size: int = 8  # change this depending on GPU limitations
+_val_batch_size: int = 100
 _sample_rate: int = 16000  # Hz
 _example_duration: float = 4.  # seconds
 _rng = np.random.default_rng(0)
 
 _root_librispeech: str = '/data/asivara/librispeech/'
-_root_demand: str = '/data/asivara/demand/'
+_root_demand: str = '/data/asivara/demand_1ch/'
 _root_fsd50k: str = '/data/asivara/fsd50k_16khz/'
 
 
@@ -628,13 +629,13 @@ def get_personalized_dataset(
                       M.iloc[env_indices]['filepath']])
 
     # segment the premixture noise similarly
+    # (note that there is no 'finetuning' premixture noise)
     split_te = len(s_te)
     split_vl = split_te + len(s_vl)
     split_ft = split_vl + len(s_ft)
     p_te = p[..., 0:split_te]
     p_vl = p[..., split_te:split_vl]
-    p_ft = p[..., split_vl:split_ft]
-    p_tr = p[..., split_ft:]
+    p_tr = p[..., split_vl:]
 
     # circularly loop the training premixture noise if it is
     # too short
@@ -644,7 +645,7 @@ def get_personalized_dataset(
     else:
         p_tr = np.tile(p_tr, (1, tile_count))
     p_tr = p_tr[..., :len(s_tr)]
-    p = np.concatenate([p_te, p_vl, p_ft, p_tr], axis=-1)
+    p = np.concatenate([p_te, p_vl, p_tr], axis=-1)
 
     # get the correct mixing scalar based on the overall
     # energies of the speech and premixture datasets
@@ -654,19 +655,28 @@ def get_personalized_dataset(
     b = np.sqrt((energy_s/energy_n)*(10**(-snr_db/10.)))
 
     # combine all the signals
+    x_tr = s_tr + b*p_tr
+    x_vl = s_vl + b*p_vl
     x_te = s_te + b*p_te
+
+    if num_environments == 1:
+        environments = [M.iloc[env_indices]['location_id']]
+    else:
+        environments = M.iloc[env_indices]['location_id']
 
     return {
         'train_speech': s_tr,
         'train_prenoise': p_tr,
+        'train_premixture': x_tr,
         'finetune_speech': s_ft,
         'val_speech': s_vl,
         'val_prenoise': p_vl,
+        'val_premixture': x_vl,
         'test_speech': s_te,
         'test_prenoise': p_te,
         'test_premixture': x_te,
         'environments': {i: j for (i, j) in enumerate(
-            M.iloc[env_indices]['location_id'])}
+            environments)}
     }
 
 
@@ -681,10 +691,13 @@ def test_model(
     def _run_test(model, test_speaker, environment_snr_db, num_environments):
         dataset = get_personalized_dataset(
             test_speaker, environment_snr_db, num_environments)
-        s_te = torch.from_numpy(dataset['test_speech']
-            ).float().flatten().unsqueeze(0).cuda()
-        x_te = torch.from_numpy(dataset['test_premixture']
-            ).float().flatten().unsqueeze(0).cuda()
+        s_te = torch.from_numpy(dataset['test_speech']).float().cuda()
+        x_te = torch.from_numpy(dataset['test_premixture']).float().cuda()
+        if len(x_te.shape) == 2 and len(s_te.shape) == 1:
+            s_te = torch.stack([s_te for _ in range(num_environments)], dim=0)
+        elif len(x_te.shape) == 1 and len(s_te.shape) == 1:
+            s_te = s_te.unsqueeze(0)
+            x_te = x_te.unsqueeze(0)
         s_hat_te = model(x_te)
         return float(sisdr_improvement(s_hat_te, s_te, x_te).mean())
 
@@ -735,9 +748,11 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None):
     if not set(expected_config.keys()).issubset(set(config.keys())):
         raise ValueError(f'Expected `config` to contain keys: '
                          f'{set(expected_config.keys())}')
-    config['batch_size'] = _batch_size
-    config['sample_rate'] = _sample_rate
-    config['example_duration'] = _example_duration
+    config['batch_size'] = config.get('batch_size', _batch_size)
+    config['val_batch_size'] = config.get('val_batch_size', _val_batch_size)
+    config['sample_rate'] = config.get('sample_rate', _sample_rate)
+    config['example_duration'] = config.get('example_duration',
+        _example_duration)
 
     # prepare neural net, optimizer, and loss function
     model, model_config = init_model(config)
@@ -759,20 +774,19 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None):
     S = load_librispeech()
     S_tr = S.query('subset_id == "train-clean-100"')
     S_vl = S.query('subset_id == "dev-clean"')
-    S_te = S.query('subset_id == "test-clean"')
     N = load_fsd50k()
     N_tr = N.query('split == "train"')
     N_vl = N.query('split == "val"')
-    N_te = N.query('split == "test"')
 
     # instantiate tensorboard
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
     output_directory = pathlib.Path('runs').joinpath(
-        current_time + '_' + ray_name(config=config))
+        current_time + '_' + trial_name(config=config))
     writer = SummaryWriter(output_directory)
     with open(output_directory.joinpath('config.yaml'), 'w',
         encoding='utf-8') as fp:
         yaml.dump(config, fp)
+        print(yaml.dump(config, default_flow_style=False))
 
     # keep track of the minimum loss (to early stop)
     min_loss, min_loss_step = np.inf, 0
@@ -831,24 +845,27 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None):
                 writer.add_scalar('MSELoss/train', float(loss_tr), step)
                 writer.add_scalar('SISDRi/train', float(sisdri_tr), step)
 
-            if (step % config.get('validate_every', 10)):
+            if (step % config.get('validate_every', 100)):
                 continue
 
             model.eval()
             with torch.no_grad():
 
-                s = wav_read_multiple(S_vl.filepath[0:_batch_size])
-                n = wav_read_multiple(N_vl.filepath[0:_batch_size])
-                x = mix_signals(s, n, 0)
-                s = torch.from_numpy(s).float().cuda()
-                x = torch.from_numpy(x).float().cuda()
-                s_hat = model(x)
-                if len(s_hat.shape) == 3:
-                    s_hat = s_hat[:, 0]
-                loss_vl = criterion(s_hat, s).mean()
-                sisdri_vl = sisdr_improvement(s_hat, s, x).mean()
-                writer.add_scalar('MSELoss/validation', float(loss_tr), step)
-                writer.add_scalar('SISDRi/validation', float(sisdri_tr), step)
+                s = wav_read_multiple(S_vl.filepath[0:_val_batch_size])
+                n = wav_read_multiple(N_vl.filepath[0:_val_batch_size])
+                x = mix_signals(s, n, np.mean(config['mixture_snr']))
+                loss_vl, sisdri_vl = [], []
+                for i in range(0, _val_batch_size, _batch_size):
+                    _s = torch.from_numpy(s[i:i+_batch_size]).float().cuda()
+                    _x = torch.from_numpy(x[i:i+_batch_size]).float().cuda()
+                    s_hat = model(_x)
+                    if len(s_hat.shape) == 3:
+                        s_hat = s_hat[:, 0]
+                    loss_vl.append(criterion(s_hat, s).cpu().numpy())
+                    sisdri_vl.append(sisdr_improvement(s_hat, s, x).cpu().numpy())
+
+                writer.add_scalar('MSELoss/validation', float(np.mean(loss_tr)), step)
+                writer.add_scalar('SISDRi/validation', float(np.mean(sisdri_tr)), step)
 
                 # checkpoint whenever validation score improves
                 if loss_vl < min_loss:
@@ -859,10 +876,17 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None):
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict()
                     }, output_directory.joinpath(f'ckpt_{step:08}.pt'))
+                    with open(output_directory.joinpath(f'best_step.txt'), 'w') as fp:
+                        print(step, file=fp)
 
     except KeyboardInterrupt as e:
         print(f'Manually exited at step {step}; '
               f'best step was {min_loss_step}.')
+        torch.save({
+            'step': step,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict()
+        }, output_directory.joinpath(f'ckpt_last.pt'))
         pass
 
     # close the summary
@@ -875,61 +899,238 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None):
     return
 
 
-def ray_launch(config: dict):
-    """Parses a Ray configuration dictionary and launches an experiment."""
-    print(config)
+def train_unsup(config: dict, checkpoint_path: Optional[str] = None):
+    """Train a self-supervised pseudo speech enhancement model."""
+
+    # verify config
+    expected_config = {
+        'test_speaker': Union[int, str],
+        'environment_snr_db': Union[float, Tuple[float, float]],
+        'num_environments': int,
+        'learning_rate': float,
+        'use_contrastive_loss': bool,
+        'use_purification_loss': bool,
+        'model_name': str,
+        'model_size': str,
+        'mixture_snr': Tuple[float, float],
+    }
+    if not set(expected_config.keys()).issubset(set(config.keys())):
+        raise ValueError(f'Expected `config` to contain keys: '
+                         f'{set(expected_config.keys())}')
+    config['batch_size'] = config.get('batch_size', _batch_size)
+    config['val_batch_size'] = config.get('val_batch_size', _val_batch_size)
+    config['sample_rate'] = config.get('sample_rate', _sample_rate)
+    config['example_duration'] = config.get('example_duration',
+        _example_duration)
+
+    # prepare neural net, optimizer, and loss function
+    model, model_config = init_model(config)
+    model = model.cuda()
+    config['model_config'] = model_config
+    optimizer = torch.optim.Adam(params=model.parameters(),
+                                 lr=config['learning_rate'])
+    criterion = torch.nn.MSELoss(reduction='mean')
+
+    # load a previous checkpoint if provided
+    init_step = 0
+    if checkpoint_path:
+        ckpt = torch.load(checkpoint_path)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        init_step = ckpt['step']
+
+    # load personalized dataset
+    dataset = get_personalized_dataset(
+        config['test_speaker'],
+        config['environment_snr_db'],
+        config['num_environments'])
+    config['environments'] = dataset['environments']
+    P_tr = dataset['train_premixture']
+    if len(P_tr.shape) == 1:
+        P_tr = P_tr[np.newaxis, ...]
+    P_vl = dataset['val_premixture']
+    if len(P_vl.shape) == 1:
+        P_vl = P_vl[np.newaxis, ...]
+    N = load_fsd50k()
+    N_tr = N.query('split == "train"')
+    N_vl = N.query('split == "val"')
+
+    def sample_premixture(data, size: int = config['batch_size']):
+        l = int(config['sample_rate'] * config['example_duration'])
+        env_indices = _rng.integers(
+            low=0,
+            high=config['num_environments'],
+            size=size)
+        starting_sample_indices = _rng.integers(
+            low=0,
+            high=int(data.shape[-1] - l - 1),
+            size=size)
+        s = []
+        for j in range(size):
+            start = int(starting_sample_indices[j])
+            s.append(data[env_indices[j], start:start+l])
+        return np.stack(s)
+
+    # instantiate tensorboard
+    current_time = datetime.now().strftime('%b%d_%H-%M-%S')
+    output_directory = pathlib.Path('runs').joinpath(
+        current_time + '_' + trial_name(config=config))
+    writer = SummaryWriter(output_directory)
+    with open(output_directory.joinpath('config.yaml'), 'w',
+        encoding='utf-8') as fp:
+        yaml.dump(config, fp)
+        print(yaml.dump(config, default_flow_style=False))
+
+    # keep track of the minimum loss (to early stop)
+    min_loss, min_loss_step = np.inf, 0
+
+    # training loop
+    try:
+        for step in itertools.count(init_step):
+
+            model.train()
+            with torch.set_grad_enabled(True):
+
+                # sample speech from the premixture data
+                s = sample_premixture(P_tr)
+                indices = np.arange(config['batch_size'] * step,
+                    config['batch_size'] * (step + 1), 1)
+                n = wav_read_multiple(N_tr.filepath[indices % len(N_tr)])
+
+                # mix the signals up at random snrs
+                snrs = _rng.uniform(low=config['mixture_snr'][0],
+                                    high=config['mixture_snr'][1],
+                                    size=(config['batch_size'], 1))
+                x = mix_signals(s, n, snrs)
+
+                # convert to tensors
+                s = torch.from_numpy(s).float().cuda()
+                x = torch.from_numpy(x).float().cuda()
+
+                # forward propagation
+                # (use gradient accumulation for TasNet models)
+                if 'tasnet' in config['model_name']:
+                    sisdri_tr = 0
+                    for i in range(_batch_size):
+                        _s, _x = s[i].unsqueeze(0), x[i].unsqueeze(0)
+                        s_hat = model(_x)
+                        if len(s_hat.shape) == 3:
+                            s_hat = s_hat[:, 0]
+                        loss_tr = criterion(s_hat, _s).mean()
+                        (loss_tr / _batch_size).backward()
+                        with torch.no_grad():
+                            sisdri_tr += sisdr_improvement(s_hat, _s, _x).mean()
+                    sisdri_tr /= _batch_size
+                else:
+                    s_hat = model(x)
+                    if len(s_hat.shape) == 3:
+                        s_hat = s_hat[:, 0]
+                    loss_tr = criterion(s_hat, s).mean()
+                    loss_tr.backward()
+                    with torch.no_grad():
+                        sisdri_tr = sisdr_improvement(s_hat, s, x).mean()
+
+                # back propagation
+                optimizer.step()
+                optimizer.zero_grad()
+
+                # write summaries
+                writer.add_scalar('MSELoss/train', float(loss_tr), step)
+                writer.add_scalar('SISDRi/train', float(sisdri_tr), step)
+
+            if (step % config.get('validate_every', 100)):
+                continue
+
+            model.eval()
+            with torch.no_grad():
+
+                s = sample_premixture(P_vl, _val_batch_size)
+                n = wav_read_multiple(N_vl.filepath[0:_val_batch_size])
+                x = mix_signals(s, n, np.mean(config['mixture_snr']))
+                loss_vl, sisdri_vl = [], []
+                for i in range(0, _val_batch_size, _batch_size):
+                    _s = torch.from_numpy(s[i:i+_batch_size]).float().cuda()
+                    _x = torch.from_numpy(x[i:i+_batch_size]).float().cuda()
+                    s_hat = model(_x)
+                    if len(s_hat.shape) == 3:
+                        s_hat = s_hat[:, 0]
+                    loss_vl.append(criterion(s_hat, s).cpu().numpy())
+                    sisdri_vl.append(sisdr_improvement(s_hat, s, x).cpu().numpy())
+                writer.add_scalar('MSELoss/validation', float(loss_tr), step)
+                writer.add_scalar('SISDRi/validation', float(sisdri_tr), step)
+
+                # checkpoint whenever validation score improves
+                if loss_vl < min_loss:
+                    min_loss = loss_vl
+                    min_loss_step = step
+                    torch.save({
+                        'step': step,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict()
+                    }, output_directory.joinpath(f'ckpt_{step:08}.pt'))
+                    with open(output_directory.joinpath(f'best_step.txt'), 'w') as fp:
+                        print(step, file=fp)
 
 
-def ray_name(trial = None, config: Optional[dict] = None):
+    except KeyboardInterrupt as e:
+        print(f'Manually exited at step {step}; '
+              f'best step was {min_loss_step}.')
+        torch.save({
+            'step': step,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict()
+        }, output_directory.joinpath(f'ckpt_last.pt'))
+        pass
+
+    # close the summary
+    writer.close()
+
+    # print the location of the checkpoints
+    print(f'Saved checkpoints to {output_directory}.')
+
+    # exit the trainer
+    return
+
+
+def trial_name(trial = None, config: Optional[dict] = None):
     if trial:
         config = trial.config
     elif not config:
         raise ValueError('Either `trial` or `config` must be set.')
-    name = '{}_{}_{}{}'.format(
-        config['training_procedure'], config['model_name'],
-        config['model_size'][0].upper(),
-        ('_'+config['test_scenario']
-            if 'selfsup' in config['training_procedure'] else '')
-    )
+    if 'unsup' in config['training_procedure']:
+        name = '{}_sp{}_env{}_psnr{}_{}_{}'.format(
+            config['training_procedure'],
+            str(config['test_speaker']),
+            str(int(config['num_environments'])),
+            str(int(np.mean(config['environment_snr_db']))),
+            config['model_name'],
+            config['model_size'][0].upper()
+        )
+    else:
+        name = '{}_{}_{}'.format(
+            config['training_procedure'],
+            config['model_name'],
+            config['model_size'][0].upper()
+        )
     return name
 
-
-def main():
-
-    # perform a sweep across all model configurations
-    config = {
-        'learning_rate': tune.grid_search([1e-3, 1e-4]),
-        'model_name': tune.grid_search([
-            'convtasnet', 'dprnntasnet', 'grunet']),
-        'model_size': tune.grid_search([
-            'small', 'medium', 'large']),
-        'training_procedure': tune.grid_search([
-            'sup', 'selfsup',
-            'selfsup+contrastive', 'selfsup+purify',
-            'selfsup+contrastive+purify'])
-    }
-    tune.run(
-        ray_launch,
-        trial_name_creator=ray_name,
-        trial_dirname_creator=ray_name,
-        local_dir='checkpoints',
-        keep_checkpoints_num=1,
-        checkpoint_score_attr='min-validation_loss',
-        progress_reporter=CLIReporter(
-            max_report_frequency=30,
-        ),
-        log_to_file=True,
-        verbose=1,
-        max_failures=-1,
-        config=config
-    )
-
-
 if __name__ == '__main__':
-    train_sup(dict(
+    # train_sup(dict(
+    #     learning_rate=1e-4,
+    #     model_name='dprnntasnet',
+    #     model_size='large',
+    #     training_procedure='sup',
+    #     mixture_snr=(-10, 10)
+    # ), 'runs/Nov02_00-35-59_sup_dprnntasnet_L/ckpt_00508510.pt')
+    train_unsup(dict(
         learning_rate=1e-4,
-        model_name='convtasnet',
-        model_size='small',
-        training_procedure='sup',
+        model_name='grunet',
+        model_size='large',
+        training_procedure='unsup',
+        use_contrastive_loss=False,
+        use_purification_loss=False,
+        test_speaker='1188',
+        num_environments=5,
+        environment_snr_db=10,
         mixture_snr=(-10, 10)
     ))
