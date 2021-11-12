@@ -36,6 +36,10 @@ _root_demand: str = '/data/asivara/demand_1ch/'
 _root_fsd50k: str = '/data/asivara/fsd50k_16khz/'
 
 
+class EarlyStopping(Exception):
+    pass
+
+
 def _jitable_shape(x: torch.Tensor):
     """Gets shape of ``tensor`` as ``torch.Tensor`` type for jit compiler
     .. note::
@@ -736,7 +740,8 @@ def test_checkpoint(
     return test_model(model, test_speaker, environment_snr_db, num_environments)
 
 
-def train_sup(config: dict, checkpoint_path: Optional[str] = None):
+def train_sup(config: dict, checkpoint_path: Optional[str] = None,
+              patience: int = 300000):
     """Train a fully-supervised speech enhancement model."""
 
     # verify config
@@ -792,6 +797,7 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None):
     min_loss, min_loss_step = np.inf, 0
 
     # training loop
+    print(f'Output Directory: {output_directory}')
     try:
         for step in itertools.count(init_step):
 
@@ -858,14 +864,14 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None):
                 for i in range(0, _val_batch_size, _batch_size):
                     _s = torch.from_numpy(s[i:i+_batch_size]).float().cuda()
                     _x = torch.from_numpy(x[i:i+_batch_size]).float().cuda()
-                    s_hat = model(_x)
-                    if len(s_hat.shape) == 3:
-                        s_hat = s_hat[:, 0]
-                    loss_vl.append(criterion(s_hat, s).cpu().numpy())
-                    sisdri_vl.append(sisdr_improvement(s_hat, s, x).cpu().numpy())
-
-                writer.add_scalar('MSELoss/validation', float(np.mean(loss_tr)), step)
-                writer.add_scalar('SISDRi/validation', float(np.mean(sisdri_tr)), step)
+                    _s_hat = model(_x)
+                    if len(_s_hat.shape) == 3:
+                        _s_hat = _s_hat[:, 0]
+                    loss_vl.append(float(criterion(_s_hat, _s).mean()))
+                    sisdri_vl.append(float(sisdr_improvement(_s_hat, _s, _x).mean()))
+                loss_vl, sisdri_vl = np.mean(loss_vl), np.mean(sisdri_vl)
+                writer.add_scalar('MSELoss/validation', float(loss_vl), step)
+                writer.add_scalar('SISDRi/validation', float(sisdri_vl), step)
 
                 # checkpoint whenever validation score improves
                 if loss_vl < min_loss:
@@ -878,6 +884,14 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None):
                     }, output_directory.joinpath(f'ckpt_{step:08}.pt'))
                     with open(output_directory.joinpath(f'best_step.txt'), 'w') as fp:
                         print(step, file=fp)
+
+                if (step - min_loss_step) > patience:
+                    raise EarlyStopping()
+
+    except EarlyStopping as e:
+        print(f'Automatically exited with patience for {patience} steps; '
+              f'best step was {min_loss_step}.')
+        pass
 
     except KeyboardInterrupt as e:
         print(f'Manually exited at step {step}; '
@@ -899,7 +913,8 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None):
     return
 
 
-def train_unsup(config: dict, checkpoint_path: Optional[str] = None):
+def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
+                patience: int = 300000):
     """Train a self-supervised pseudo speech enhancement model."""
 
     # verify config
@@ -985,6 +1000,7 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None):
     min_loss, min_loss_step = np.inf, 0
 
     # training loop
+    print(f'Output Directory: {output_directory}')
     try:
         for step in itertools.count(init_step):
 
@@ -1051,13 +1067,14 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None):
                 for i in range(0, _val_batch_size, _batch_size):
                     _s = torch.from_numpy(s[i:i+_batch_size]).float().cuda()
                     _x = torch.from_numpy(x[i:i+_batch_size]).float().cuda()
-                    s_hat = model(_x)
-                    if len(s_hat.shape) == 3:
-                        s_hat = s_hat[:, 0]
-                    loss_vl.append(criterion(s_hat, s).cpu().numpy())
-                    sisdri_vl.append(sisdr_improvement(s_hat, s, x).cpu().numpy())
-                writer.add_scalar('MSELoss/validation', float(loss_tr), step)
-                writer.add_scalar('SISDRi/validation', float(sisdri_tr), step)
+                    _s_hat = model(_x)
+                    if len(_s_hat.shape) == 3:
+                        _s_hat = _s_hat[:, 0]
+                    loss_vl.append(float(criterion(_s_hat, _s).mean()))
+                    sisdri_vl.append(float(sisdr_improvement(_s_hat, _s, _x).mean()))
+                loss_vl, sisdri_vl = np.mean(loss_vl), np.mean(sisdri_vl)
+                writer.add_scalar('MSELoss/validation', float(loss_vl), step)
+                writer.add_scalar('SISDRi/validation', float(sisdri_vl), step)
 
                 # checkpoint whenever validation score improves
                 if loss_vl < min_loss:
@@ -1071,6 +1088,13 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None):
                     with open(output_directory.joinpath(f'best_step.txt'), 'w') as fp:
                         print(step, file=fp)
 
+                if (step - min_loss_step) > patience:
+                    raise EarlyStopping()
+
+    except EarlyStopping as e:
+        print(f'Automatically exited with patience for {patience} steps; '
+              f'best step was {min_loss_step}.')
+        pass
 
     except KeyboardInterrupt as e:
         print(f'Manually exited at step {step}; '
@@ -1114,23 +1138,27 @@ def trial_name(trial = None, config: Optional[dict] = None):
         )
     return name
 
+
 if __name__ == '__main__':
     # train_sup(dict(
     #     learning_rate=1e-4,
-    #     model_name='dprnntasnet',
-    #     model_size='large',
+    #     model_name='convtasnet',
+    #     model_size='medium',
     #     training_procedure='sup',
     #     mixture_snr=(-10, 10)
-    # ), 'runs/Nov02_00-35-59_sup_dprnntasnet_L/ckpt_00508510.pt')
-    train_unsup(dict(
-        learning_rate=1e-4,
-        model_name='grunet',
-        model_size='large',
-        training_procedure='unsup',
-        use_contrastive_loss=False,
-        use_purification_loss=False,
-        test_speaker='1188',
-        num_environments=5,
-        environment_snr_db=10,
-        mixture_snr=(-10, 10)
-    ))
+    # ))
+    S_te = load_librispeech().query('subset_id == "test-clean"')
+    test_speakers = S_te['speaker_id'].astype(str).unique()
+    for test_speaker in test_speakers:
+        train_unsup(dict(
+            learning_rate=1e-4,
+            model_name='grunet',
+            model_size='large',
+            training_procedure='unsup',
+            use_contrastive_loss=False,
+            use_purification_loss=False,
+            test_speaker=test_speaker,
+            num_environments=1,
+            environment_snr_db=10,
+            mixture_snr=(-10, 10)
+        ))
