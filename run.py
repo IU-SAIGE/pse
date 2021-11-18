@@ -7,6 +7,7 @@ import pandas as pd
 import soundfile as sf
 import torch
 import yaml
+import warnings
 
 from asteroid.losses.sdr import singlesrc_neg_sisdr
 from datetime import datetime
@@ -15,11 +16,14 @@ from ray import tune
 from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn.modules.loss import _Loss
+from torch.nn import functional as F
 from typing import Optional
 from typing import Sequence
 from typing import Tuple
 from typing import Union
 
+warnings.filterwarnings('ignore')
 
 _fft_size: int = 1024
 _hop_size: int = 256
@@ -38,6 +42,10 @@ _root_fsd50k: str = '/data/asivara/fsd50k_16khz/'
 
 class EarlyStopping(Exception):
     pass
+
+
+def _logistic(v, beta: float = 1., offset: float = 0.):
+    return (1 / (1 + torch.exp(-beta * (v - offset))))
 
 
 def _jitable_shape(x: torch.Tensor):
@@ -176,6 +184,111 @@ def _istft(spectrogram: torch.Tensor, mask: Optional[torch.Tensor] = None):
     return waveform
 
 
+class SegmentalLoss(_Loss):
+    '''Loss function applied to audio segmented frame by frame.'''
+
+    def __init__(
+        self,
+        loss_type: str = 'sisdr',
+        reduction: str = 'none',
+        segment_size: int = 1024,
+        hop_length: int = 256,
+        windowing: bool = True,
+        centering: bool = True,
+        pad_mode: str = 'reflect'
+    ):
+        super().__init__(reduction=reduction)
+        assert loss_type in ('mse', 'snr', 'sisdr', 'sdsdr')
+        assert pad_mode in ('constant', 'reflect')
+        assert isinstance(centering, bool)
+        assert isinstance(windowing, bool)
+        assert segment_size > hop_length > 0
+
+        self.loss_type = loss_type
+        self.segment_size = segment_size
+        self.hop_length = hop_length
+        self.pad_mode = pad_mode
+
+        self.centering = centering
+        self.windowing = windowing
+
+        self.unfold = torch.nn.Unfold(
+            kernel_size=(1, segment_size),
+            stride=(1, hop_length)
+        )
+        self.window = torch.hann_window(self.segment_size).view(1, 1, -1)
+
+    def forward(
+        self,
+        estimate: torch.Tensor,
+        target: torch.Tensor,
+        weights: Optional[torch.Tensor] = None,
+    ):
+        assert target.size() == estimate.size()
+        assert target.ndim == 2
+        assert self.segment_size < target.size()[-1]
+
+        # subtract signal means
+        target -= torch.mean(target, dim=1, keepdim=True)
+        estimate -= torch.mean(estimate, dim=1, keepdim=True)
+
+        # center the signals using padding
+        if self.centering:
+            signal_dim = target.dim()
+            ext_shape = [1] * (3 - signal_dim) + list(target.size())
+            p = int(self.segment_size // 2)
+            target = F.pad(target.view(ext_shape), [p, p], self.pad_mode)
+            target = target.view(target.shape[-signal_dim:])
+            estimate = F.pad(estimate.view(ext_shape), [p, p], self.pad_mode)
+            estimate = estimate.view(estimate.shape[-signal_dim:])
+
+        # use unfold to construct overlapping frames out of inputs
+        n_batch = target.size()[0]
+        target = self.unfold(target.view(n_batch,1,1,-1)).permute(0,2,1)
+        estimate = self.unfold(estimate.view(n_batch,1,1,-1)).permute(0,2,1)
+
+        # window all the frames
+        if self.windowing:
+            self.window = self.window.to(target.device)
+            target = torch.multiply(target, self.window)
+            estimate = torch.multiply(estimate, self.window)
+
+        # MSE loss
+        if self.loss_type == 'mse':
+            losses = ((target - estimate)**2).sum(dim=2)
+            losses /= self.segment_size
+
+        # SDR based loss
+        else:
+
+            if self.loss_type == 'snr':
+                scaled_target = target
+            else:
+                dot = (estimate * target).sum(dim=2, keepdim=True)
+                s_target_energy = (target ** 2).sum(dim=2, keepdim=True) + EPS
+                scaled_target = dot * target / s_target_energy
+
+            if self.loss_type == 'sisdr':
+                e_noise = estimate - scaled_target
+            else:
+                e_noise = estimate - target
+
+            losses = (scaled_target ** 2).sum(dim=2)
+            losses = losses / ((e_noise ** 2).sum(dim=2) + EPS)
+            losses = -10 * torch.log10(losses + EPS)
+
+        # apply weighting (if provided)
+        if weights is not None:
+            assert losses.size() == weights.size()
+            weights = weights.detach()
+            losses = torch.multiply(losses, weights).mean(dim=1)
+
+        if self.reduction == 'mean':
+            losses = losses.mean()
+
+        return losses
+
+
 class ConvTasNet(asteroid.models.ConvTasNet):
     # forward = _forward
     pass
@@ -221,6 +334,40 @@ class GRUNet(torch.nn.Module):
         denoised = _istft(X, mask=Y)
 
         return denoised
+
+
+class SNRPredictor(torch.nn.Module):
+
+    def __init__(self, hidden_size: int = 1024, num_layers: int = 3):
+        super().__init__()
+        self.hidden_size: int = hidden_size
+        self.num_layers: int = num_layers
+
+        # layers
+        self.rnn = torch.nn.GRU(
+            input_size=int(_fft_size // 2 + 1),
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            batch_first=True
+        )
+        self.dnn = torch.nn.Linear(
+            in_features=self.hidden_size,
+            out_features=1
+        )
+
+    def forward(self, waveform: torch.Tensor):
+
+        # convert to time-frequency domain
+        (_, X_magnitude) = _stft(waveform)
+
+        # generate frame-by-frame SNR predictions
+        predicted_snrs = self.dnn(self.rnn(X_magnitude)[0]).reshape(
+            -1, X_magnitude.shape[1])
+
+        return predicted_snrs
+
+    def load(self, checkpoint_path: str):
+        self.load_state_dict(torch.load('snr_predictor'), strict=False)
 
 
 def sisdr(estimate: torch.Tensor, target: torch.Tensor,
@@ -864,11 +1011,11 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None,
                 for i in range(0, _val_batch_size, _batch_size):
                     _s = torch.from_numpy(s[i:i+_batch_size]).float().cuda()
                     _x = torch.from_numpy(x[i:i+_batch_size]).float().cuda()
-                    _s_hat = model(_x)
-                    if len(_s_hat.shape) == 3:
-                        _s_hat = _s_hat[:, 0]
-                    loss_vl.append(float(criterion(_s_hat, _s).mean()))
-                    sisdri_vl.append(float(sisdr_improvement(_s_hat, _s, _x).mean()))
+                    s_hat = model(_x)
+                    if len(s_hat.shape) == 3:
+                        s_hat = s_hat[:, 0]
+                    loss_vl.append(float(criterion(s_hat, _s).mean()))
+                    sisdri_vl.append(float(sisdr_improvement(s_hat, _s, _x).mean()))
                 loss_vl, sisdri_vl = np.mean(loss_vl), np.mean(sisdri_vl)
                 writer.add_scalar('MSELoss/validation', float(loss_vl), step)
                 writer.add_scalar('SISDRi/validation', float(sisdri_vl), step)
@@ -945,6 +1092,13 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
     optimizer = torch.optim.Adam(params=model.parameters(),
                                  lr=config['learning_rate'])
     criterion = torch.nn.MSELoss(reduction='mean')
+
+    # instantiate SNR predictor and segmental loss function if needed
+    if config['use_purification_loss']:
+        criterion = SegmentalLoss('mse', reduction='mean')
+        predictor = SNRPredictor()
+        predictor.load_state_dict(torch.load('snr_predictor'), strict=False)
+        predictor = predictor.cuda()
 
     # load a previous checkpoint if provided
     init_step = 0
@@ -1032,7 +1186,11 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
                         s_hat = model(_x)
                         if len(s_hat.shape) == 3:
                             s_hat = s_hat[:, 0]
-                        loss_tr = criterion(s_hat, _s).mean()
+                        if config['use_purification_loss']:
+                            w = _logistic(predictor(_s))
+                            loss_tr = criterion(s_hat, _s, w).mean()
+                        else:
+                            loss_tr = criterion(s_hat, _s).mean()
                         (loss_tr / _batch_size).backward()
                         with torch.no_grad():
                             sisdri_tr += sisdr_improvement(s_hat, _s, _x).mean()
@@ -1041,7 +1199,11 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
                     s_hat = model(x)
                     if len(s_hat.shape) == 3:
                         s_hat = s_hat[:, 0]
-                    loss_tr = criterion(s_hat, s).mean()
+                    if config['use_purification_loss']:
+                        w = _logistic(predictor(s))
+                        loss_tr = criterion(s_hat, s, w).mean()
+                    else:
+                        loss_tr = criterion(s_hat, s).mean()
                     loss_tr.backward()
                     with torch.no_grad():
                         sisdri_tr = sisdr_improvement(s_hat, s, x).mean()
@@ -1067,11 +1229,11 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
                 for i in range(0, _val_batch_size, _batch_size):
                     _s = torch.from_numpy(s[i:i+_batch_size]).float().cuda()
                     _x = torch.from_numpy(x[i:i+_batch_size]).float().cuda()
-                    _s_hat = model(_x)
-                    if len(_s_hat.shape) == 3:
-                        _s_hat = _s_hat[:, 0]
-                    loss_vl.append(float(criterion(_s_hat, _s).mean()))
-                    sisdri_vl.append(float(sisdr_improvement(_s_hat, _s, _x).mean()))
+                    s_hat = model(_x)
+                    if len(s_hat.shape) == 3:
+                        s_hat = s_hat[:, 0]
+                    loss_vl.append(float(criterion(s_hat, _s).mean()))
+                    sisdri_vl.append(float(sisdr_improvement(s_hat, _s, _x).mean()))
                 loss_vl, sisdri_vl = np.mean(loss_vl), np.mean(sisdri_vl)
                 writer.add_scalar('MSELoss/validation', float(loss_vl), step)
                 writer.add_scalar('SISDRi/validation', float(sisdri_vl), step)
@@ -1148,17 +1310,17 @@ if __name__ == '__main__':
     #     mixture_snr=(-10, 10)
     # ))
     S_te = load_librispeech().query('subset_id == "test-clean"')
-    test_speakers = S_te['speaker_id'].astype(str).unique()
+    test_speakers = sorted(S_te['speaker_id'].astype(str).unique())
     for test_speaker in test_speakers:
         train_unsup(dict(
             learning_rate=1e-4,
             model_name='grunet',
-            model_size='large',
-            training_procedure='unsup',
+            model_size='small',
+            training_procedure='unsup+dp',
             use_contrastive_loss=False,
-            use_purification_loss=False,
+            use_purification_loss=True,
             test_speaker=test_speaker,
             num_environments=1,
-            environment_snr_db=10,
+            environment_snr_db=5,
             mixture_snr=(-10, 10)
         ))
