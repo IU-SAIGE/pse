@@ -1,735 +1,47 @@
-import asteroid.models
 import itertools
-import numpy as np
-import pathlib
 import os
-import pandas as pd
-import soundfile as sf
-import torch
-import yaml
+import pathlib
 import warnings
-
-from asteroid.losses.sdr import singlesrc_neg_sisdr
 from datetime import datetime
-from ray import tune
-from ray import tune
-from ray.tune import CLIReporter
-from ray.tune.schedulers import ASHAScheduler
-from torch.utils.tensorboard import SummaryWriter
-from torch.nn.modules.loss import _Loss
-from torch.nn import functional as F
 from typing import Optional
-from typing import Sequence
 from typing import Tuple
 from typing import Union
 
+import exp_data as exd
+import exp_models as exm
+
+import numpy as np
+import torch
+import yaml
+from torch.utils.tensorboard import SummaryWriter
+
 warnings.filterwarnings('ignore')
 
-_fft_size: int = 1024
-_hop_size: int = 256
-_window = torch.hann_window(_fft_size)
-_eps: float = 1e-8
 _batch_size: int = 8  # change this depending on GPU limitations
 _val_batch_size: int = 100
-_sample_rate: int = 16000  # Hz
-_example_duration: float = 4.  # seconds
-_rng = np.random.default_rng(0)
 
-_root_librispeech: str = '/data/asivara/librispeech/'
-_root_demand: str = '/data/asivara/demand_1ch/'
-_root_fsd50k: str = '/data/asivara/fsd50k_16khz/'
+_rng = np.random.default_rng(0)
 
 
 class EarlyStopping(Exception):
     pass
 
 
-def _logistic(v, beta: float = 1., offset: float = 0.):
-    return (1 / (1 + torch.exp(-beta * (v - offset))))
-
-
-def _jitable_shape(x: torch.Tensor):
-    """Gets shape of ``tensor`` as ``torch.Tensor`` type for jit compiler
-    .. note::
-        Returning ``tensor.shape`` of ``tensor.shape`` directly is not torchscript
-        compatible as return type would not be supported.
-    Args:
-        tensor (torch.Tensor): Tensor
-    Returns:
-        torch.Tensor: Shape of ``tensor``
-    """
-    return torch.tensor(x.shape)
-
-
-def _unsqueeze_to_3d(x: torch.Tensor):
-    """Normalize shape of `x` to [batch, n_chan, time]."""
-    if x.ndim == 1:
-        return x.reshape(1, 1, -1)
-    elif x.ndim == 2:
-        return x.unsqueeze(1)
-    else:
-        return x
-
-
-def _unsqueeze_to_2d(x: torch.Tensor):
-    """Normalize shape of `x` to [batch, time]."""
-    if x.ndim == 1:
-        return x.reshape(1, -1)
-    elif x.ndim == 3:
-        return x.squeeze(1)
-    else:
-        return x
-
-
-def _pad_x_to_y(x: torch.Tensor, y: torch.Tensor, axis: int = -1):
-    """Right-pad or right-trim first argument to have same size as second argument
-    Args:
-        x (torch.Tensor): Tensor to be padded.
-        y (torch.Tensor): Tensor to pad `x` to.
-        axis (int): Axis to pad on.
-    Returns:
-        torch.Tensor, `x` padded to match `y`'s shape.
-    """
-    if axis != -1:
-        raise NotImplementedError
-    inp_len = y.shape[axis]
-    output_len = x.shape[axis]
-    return torch.nn.functional.pad(x, [0, inp_len - output_len])
-
-
-def _shape_reconstructed(reconstructed: torch.Tensor, size: torch.Tensor):
-    """Reshape `reconstructed` to have same size as `size`
-    Args:
-        reconstructed (torch.Tensor): Reconstructed waveform
-        size (torch.Tensor): Size of desired waveform
-    Returns:
-        torch.Tensor: Reshaped waveform
-    """
-    if len(size) == 1:
-        return reconstructed.squeeze(0)
-    return reconstructed
-
-
-def _forward(self, waveform: torch.Tensor, num_masks: int = 1):
-    """Custom forward function to do single-mask two-source estimation.
-    Args:
-        waveform (torch.Tensor): mixture waveform
-    Returns:
-        torch.Tensor: estimate waveforms
-    """
-    # Remember shape to shape reconstruction, cast to Tensor for torchscript
-    shape = _jitable_shape(waveform)
-
-    # Reshape to (batch, n_mix, time)
-    waveform = _unsqueeze_to_3d(waveform)
-
-    # Real forward
-    tf_rep = self.forward_encoder(waveform)
-    est_masks = self.forward_masker(tf_rep)
-    if num_masks == 1:
-        est_masks = est_masks.repeat(1, 2, 1, 1)
-        est_masks[:, 1] = 1 - est_masks[:, 1]
-    masked_tf_rep = self.apply_masks(tf_rep, est_masks)
-    decoded = self.forward_decoder(masked_tf_rep)
-
-    reconstructed = _pad_x_to_y(decoded, waveform)
-    return _shape_reconstructed(reconstructed, shape)
-
-
-def _seed_everything(seed_value: int = 0):
-    """Fix pseudo-random seed."""
-    np.random.seed(seed_value)
-    torch.manual_seed(seed_value)
-    torch.cuda.manual_seed_all(seed_value)
-
-
-def _stft(waveform: torch.Tensor):
-    """Calculates the Short-time Fourier transform (STFT)."""
-
-    # perform the short-time Fourier transform
-    spectrogram = torch.stft(
-        waveform, _fft_size, _hop_size,
-        window=_window.to(waveform.device),
-        return_complex=False
-    )
-
-    # swap seq_len & feature_dim of the spectrogram (for RNN processing)
-    spectrogram = spectrogram.permute(0, 2, 1, 3)
-
-    # calculate the magnitude spectrogram
-    magnitude_spectrogram = torch.sqrt(spectrogram[..., 0] ** 2 +
-                                       spectrogram[..., 1] ** 2)
-
-    return (spectrogram, magnitude_spectrogram)
-
-
-def _istft(spectrogram: torch.Tensor, mask: Optional[torch.Tensor] = None):
-    """Calculates the inverse Short-time Fourier transform (ISTFT)."""
-
-    # apply a time-frequency mask if provided
-    if mask is not None:
-        spectrogram[..., 0] *= mask
-        spectrogram[..., 1] *= mask
-
-    # swap seq_len & feature_dim of the spectrogram (undo RNN processing)
-    spectrogram = spectrogram.permute(0, 2, 1, 3)
-
-    # perform the inverse short-time Fourier transform
-    waveform = torch.istft(
-        spectrogram, _fft_size, _hop_size,
-        window=_window.to(spectrogram.device),
-        return_complex=False
-    )
-
-    return waveform
-
-
-class SegmentalLoss(_Loss):
-    '''Loss function applied to audio segmented frame by frame.'''
-
-    def __init__(
-        self,
-        loss_type: str = 'sisdr',
-        reduction: str = 'none',
-        segment_size: int = 1024,
-        hop_length: int = 256,
-        windowing: bool = True,
-        centering: bool = True,
-        pad_mode: str = 'reflect'
-    ):
-        super().__init__(reduction=reduction)
-        assert loss_type in ('mse', 'snr', 'sisdr', 'sdsdr')
-        assert pad_mode in ('constant', 'reflect')
-        assert isinstance(centering, bool)
-        assert isinstance(windowing, bool)
-        assert segment_size > hop_length > 0
-
-        self.loss_type = loss_type
-        self.segment_size = segment_size
-        self.hop_length = hop_length
-        self.pad_mode = pad_mode
-
-        self.centering = centering
-        self.windowing = windowing
-
-        self.unfold = torch.nn.Unfold(
-            kernel_size=(1, segment_size),
-            stride=(1, hop_length)
-        )
-        self.window = torch.hann_window(self.segment_size).view(1, 1, -1)
-
-    def forward(
-        self,
-        estimate: torch.Tensor,
-        target: torch.Tensor,
-        weights: Optional[torch.Tensor] = None,
-    ):
-        assert target.size() == estimate.size()
-        assert target.ndim == 2
-        assert self.segment_size < target.size()[-1]
-
-        # subtract signal means
-        target -= torch.mean(target, dim=1, keepdim=True)
-        estimate -= torch.mean(estimate, dim=1, keepdim=True)
-
-        # center the signals using padding
-        if self.centering:
-            signal_dim = target.dim()
-            ext_shape = [1] * (3 - signal_dim) + list(target.size())
-            p = int(self.segment_size // 2)
-            target = F.pad(target.view(ext_shape), [p, p], self.pad_mode)
-            target = target.view(target.shape[-signal_dim:])
-            estimate = F.pad(estimate.view(ext_shape), [p, p], self.pad_mode)
-            estimate = estimate.view(estimate.shape[-signal_dim:])
-
-        # use unfold to construct overlapping frames out of inputs
-        n_batch = target.size()[0]
-        target = self.unfold(target.view(n_batch,1,1,-1)).permute(0,2,1)
-        estimate = self.unfold(estimate.view(n_batch,1,1,-1)).permute(0,2,1)
-
-        # window all the frames
-        if self.windowing:
-            self.window = self.window.to(target.device)
-            target = torch.multiply(target, self.window)
-            estimate = torch.multiply(estimate, self.window)
-
-        # MSE loss
-        if self.loss_type == 'mse':
-            losses = ((target - estimate)**2).sum(dim=2)
-            losses /= self.segment_size
-
-        # SDR based loss
-        else:
-
-            if self.loss_type == 'snr':
-                scaled_target = target
-            else:
-                dot = (estimate * target).sum(dim=2, keepdim=True)
-                s_target_energy = (target ** 2).sum(dim=2, keepdim=True) + EPS
-                scaled_target = dot * target / s_target_energy
-
-            if self.loss_type == 'sisdr':
-                e_noise = estimate - scaled_target
-            else:
-                e_noise = estimate - target
-
-            losses = (scaled_target ** 2).sum(dim=2)
-            losses = losses / ((e_noise ** 2).sum(dim=2) + EPS)
-            losses = -10 * torch.log10(losses + EPS)
-
-        # apply weighting (if provided)
-        if weights is not None:
-            assert losses.size() == weights.size()
-            weights = weights.detach()
-            losses = torch.multiply(losses, weights).mean(dim=1)
-
-        if self.reduction == 'mean':
-            losses = losses.mean()
-
-        return losses
-
-
-class ConvTasNet(asteroid.models.ConvTasNet):
-    # forward = _forward
-    pass
-
-
-class DPRNNTasNet(asteroid.models.DPRNNTasNet):
-    # forward = _forward
-    pass
-
-
-class GRUNet(torch.nn.Module):
-
-    def __init__(self, hidden_size: int, num_layers: int = 2):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-
-        # create a neural network which predicts a TF binary ratio mask
-        self.rnn = torch.nn.GRU(
-            input_size=int(_fft_size // 2 + 1),
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
-            batch_first=True
-        )
-        self.dnn = torch.nn.Sequential(
-            torch.nn.Linear(
-                in_features=self.hidden_size,
-                out_features=int(_fft_size // 2 + 1)
-            ),
-            torch.nn.Sigmoid()
-        )
-
-    def forward(self, waveform: torch.Tensor):
-        # convert waveform to spectrogram
-        (X, X_magnitude) = _stft(waveform)
-
-        # generate a time-frequency mask
-        H = self.rnn(X_magnitude)[0]
-        Y = self.dnn(H)
-        Y = Y.reshape_as(X_magnitude)
-
-        # convert masked spectrogram back to waveform
-        denoised = _istft(X, mask=Y)
-
-        return denoised
-
-
-class SNRPredictor(torch.nn.Module):
-
-    def __init__(self, hidden_size: int = 1024, num_layers: int = 3):
-        super().__init__()
-        self.hidden_size: int = hidden_size
-        self.num_layers: int = num_layers
-
-        # layers
-        self.rnn = torch.nn.GRU(
-            input_size=int(_fft_size // 2 + 1),
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
-            batch_first=True
-        )
-        self.dnn = torch.nn.Linear(
-            in_features=self.hidden_size,
-            out_features=1
-        )
-
-    def forward(self, waveform: torch.Tensor):
-
-        # convert to time-frequency domain
-        (_, X_magnitude) = _stft(waveform)
-
-        # generate frame-by-frame SNR predictions
-        predicted_snrs = self.dnn(self.rnn(X_magnitude)[0]).reshape(
-            -1, X_magnitude.shape[1])
-
-        return predicted_snrs
-
-    def load(self, checkpoint_path: str):
-        self.load_state_dict(torch.load('snr_predictor'), strict=False)
-
-
-def sisdr(estimate: torch.Tensor, target: torch.Tensor,
-          reduction: Optional[str] = None):
-    """Calculate single source SI-SDR."""
-    def _fix(signal):
-        if isinstance(signal, np.ndarray):
-            signal = torch.from_numpy(signal)
-        if len(signal.shape) < 2:
-            signal = signal.unsqueeze(0)
-        if len(signal.shape) > 2:
-            signal = signal.squeeze(-2)
-        return signal
-    ml = min(estimate.shape[-1], target.shape[-1])
-    estimate, target = _fix(estimate)[..., :ml], _fix(target)[..., :ml]
-    output = -1 * singlesrc_neg_sisdr(estimate, target)
-    if reduction == 'mean':
-        output = torch.mean(output)
-    return output
-
-
-def sisdr_improvement(estimate: torch.Tensor, target: torch.Tensor,
-                      mixture: torch.Tensor, reduction: Optional[str] = None):
-    """Calculate estimate to target SI-SDR improvement relative to mixture.
-    """
-    output = sisdr(estimate, target) - sisdr(estimate, mixture)
-    if reduction == 'mean':
-        output = torch.mean(output)
-    return output
-
-
-def mix_signals(source: np.ndarray, interferer: np.ndarray, snr_db: float):
-    """Function to mix signals.
-
-    Args:
-        source (np.ndarray): source signal
-        interferer (np.ndarray): interferer signal
-        snr_db (float): desired mixture SNR in decibels (by scaling interferer)
-
-    Returns:
-        mixture (np.ndarray): mixture signal
-    """
-    energy_s = np.sum(source**2, axis=-1, keepdims=True)
-    energy_n = np.sum(interferer**2, axis=-1, keepdims=True)
-    b = np.sqrt((energy_s/energy_n)*(10**(-snr_db/10.)))
-    return (source + b*interferer)
-
-
-def wav_read(filepath: pathlib.Path):
-    """Reads mono audio from WAV."""
-    y, sr = sf.read(filepath, dtype='float32', always_2d=True)
-    if sr != _sample_rate:
-        raise IOError(f'Expected sample_rate={_sample_rate}, got {sr}.')
-    # always pick up the first channel
-    return y[..., 0]
-
-
-def wav_read_multiple(filepaths: Sequence[pathlib.Path],
-                      sample_within: bool = True):
-    signals = []
-    min_length = int(_example_duration * _sample_rate)
-    for filepath in filepaths:
-        s = wav_read(filepath)
-        duration = len(s) / _sample_rate
-        if sample_within:
-            if (duration < _example_duration):
-                raise ValueError(f'Expected {filepath} to have minimum duration'
-                                 f'of {_example_duration} seconds.')
-            offset = 0
-            try:
-                if len(s) > min_length:
-                    offset = _rng.integers(0, len(s) - min_length)
-            except ValueError as e:
-                print(filepath, len(s), min_length)
-                raise e
-            s = s[offset:offset+min_length]
-        signals.append(s)
-        if len(signals) > 1:
-            if len(signals[-1]) != len(signals[-2]):
-                raise ValueError('If sample_within=False, all signals '
-                                 'should have equal length.')
-    return np.stack(signals, axis=0)
-
-
-def init_convtasnet(N=512, L=16, B=128, H=512, Sc=128, P=3, X=8, R=3,
-                    causal=False):
-    model_config = locals()
-    return (ConvTasNet(
-        # n_src hardcoded to 1 to trigger custom forward / speech enhancement
-        n_src=1,
-        n_filters=N,
-        kernel_size=L,
-        bn_chan=B,
-        hid_chan=H,
-        skip_chan=Sc,
-        conv_kernel_size=P,
-        n_blocks=X,
-        n_repeats=R,
-        causal=causal
-    ), model_config)
-
-
-def init_dprnntasnet(N=512, L=16, B=128, H=256, Sc=128, P=3, X=8, R=3,
-                    causal=False):
-    model_config = locals()
-    return (DPRNNTasNet(
-        # n_src hardcoded to 1 to trigger custom forward / speech enhancement
-        n_src=1,
-        n_filters=N,
-        kernel_size=L,
-        bn_chan=B,
-        hid_chan=H,
-        skip_chan=Sc,
-        conv_kernel_size=P,
-        n_blocks=X,
-        n_repeats=R,
-        causal=causal
-    ), model_config)
-
-
-def init_model(config: dict) -> torch.nn.Module:
-    """Instantiates model based on name and size."""
-
-    # verify config
-    expected_keys = {'model_name', 'model_size'}
-    if not expected_keys.issubset(set(config.keys())):
-        raise ValueError(f'Expected `config` to contain keys: {expected_keys}')
-
-    # instantiate network
-    model: torch.nn.Module
-    model_config: dict
-    size: int
-    if config['model_name'] == 'convtasnet':
-        model, model_config = init_convtasnet(R={
-            'small': 1,
-            'medium': 2,
-            'large': 3
-        }.get(config['model_size']))
-    elif config['model_name'] == 'dprnntasnet':
-        model, model_config = init_dprnntasnet(R={
-            'small': 1,
-            'medium': 2,
-            'large': 3
-        }.get(config['model_size']))
-    elif config['model_name'] == 'grunet':
-        model = GRUNet(hidden_size={
-            'small': 128,
-            'medium': 256,
-            'large': 512
-        }.get(config['model_size']))
-        model_config = dict(hidden_size={
-            'small': 128,
-            'medium': 256,
-            'large': 512
-        }.get(config['model_size']))
-    else:
-        raise ValueError('Unsupported model name: "'+config['model_name']+'".')
-
-    return model, model_config
-
-
-def load_librispeech(dataset_directory: Union[str, os.PathLike] = _root_librispeech):
-    """Creates a dataframe from Librispeech (see https://www.openslr.org/12).
-    """
-    valid_subsets = [
-        'train-clean-100',
-        'train-clean-360',
-        'dev-clean',
-        'test-clean'
-    ]
-    dataset_directory = pathlib.Path(dataset_directory)
-    if not dataset_directory.joinpath('dataframe.csv').exists():
-        rows = []
-        columns = [
-            'subset_id',
-            'speaker_id',
-            'chapter_id',
-            'utterance_id',
-            'filepath',
-            'duration'
-        ]
-        for filepath in sorted(dataset_directory.rglob('*.wav')):
-            subset_id = [_ for _ in valid_subsets if _ in str(filepath)][0]
-            speaker_id, chapter_id, utterance_id = filepath.stem.split('-')
-            duration = len(wav_read(filepath)) / _sample_rate
-            rows.append((subset_id, speaker_id, chapter_id,
-                         utterance_id, str(filepath), duration))
-        if not len(rows):
-            raise ValueError(f'Could not find any .WAV files within '
-                             f'{dataset_directory}.')
-        df = pd.DataFrame(rows, columns=columns)
-        df.to_csv(dataset_directory.joinpath('dataframe.csv'),
-              header=columns,
-              index=False,
-              index_label=False)
-    else:
-        df = pd.read_csv(dataset_directory.joinpath('dataframe.csv'))
-
-    # discard recordings from speakers who possess clipped recordings
-    # (manually found using SoX, where 'volume adjustment' == 1.000)
-    clipped_speakers = [ '101', '1069', '1175', '118', '1290', '1379', '1456',
-        '1552', '1578', '1629', '1754', '1933', '1943', '1963', '198', '204',
-        '2094', '2113', '2149', '22', '2269', '2618', '2751', '307', '3168',
-        '323', '3294', '3374', '345', '3486', '3490', '3615', '3738', '380',
-        '4148', '446', '459', '4734', '481', '5002', '5012', '5333', '549',
-        '5561', '5588', '559', '5678', '5740', '576', '593', '6295', '6673',
-        '7139', '716', '7434', '7800', '781', '8329', '8347', '882' ]
-    df = df[~df['speaker_id'].isin(clipped_speakers)]
-
-    # omit recordings which are smaller than an example
-    df = df.query('duration >= @_example_duration')
-
-    # shuffle the recordings, then organize by split
-    df = df.sample(frac=1, random_state=0)
-    df['subset_id'] = pd.Categorical(df['subset_id'], valid_subsets)
-    df = df.sort_values('subset_id')
-
-    return df.reset_index(drop=True)
-
-
-def load_demand(dataset_directory: Union[str, os.PathLike] = _root_demand):
-    """Creates a dataframe from DEMAND (see https://zenodo.org/record/1227121).
-    """
-    dataset_directory = pathlib.Path(dataset_directory)
-    if not dataset_directory.joinpath('dataframe.csv').exists():
-        rows = []
-        valid_categories = [
-            'domestic',
-            'nature',
-            'office',
-            'public',
-            'street',
-            'transportation'
-        ]
-        valid_locations = [
-            'kitchen',
-            'washing',
-            'park',
-            'hallway',
-            'office',
-            'resto',
-            'psquare',
-            'bus',
-            'metro',
-            'living',
-            'field',
-            'river',
-            'meeting',
-            'cafeter',
-            'station',
-            'traffic',
-            'car'
-        ]
-        columns = [
-            'category_id',
-            'location_id',
-            'filepath',
-            'duration'
-        ]
-        for filepath in sorted(dataset_directory.rglob('*.wav')):
-            if 'ch01' not in filepath.stem:
-                continue
-            category_id = [_ for _ in valid_categories if
-                           _[0].upper() == filepath.parent.stem[0].upper()][0]
-            location_id = [_ for _ in valid_locations if
-                           filepath.parent.stem[1:].upper() in _.upper()][0]
-            duration = len(wav_read(filepath)) / _sample_rate
-            rows.append((category_id, location_id, str(filepath), duration))
-        if not len(rows):
-            raise ValueError(f'Could not find any .WAV files within '
-                             f'{dataset_directory}.')
-        df = pd.DataFrame(rows, columns=columns)
-        df.to_csv(dataset_directory.joinpath('dataframe.csv'),
-              header=columns,
-              index=False,
-              index_label=False)
-    else:
-        df = pd.read_csv(dataset_directory.joinpath('dataframe.csv'))
-
-    # shuffle the recordings
-    df = df.sample(frac=1, random_state=0)
-
-    return df.reset_index(drop=True)
-
-
-def load_fsd50k(dataset_directory: Union[str, os.PathLike] = _root_fsd50k):
-    """Creates a dataframe from FSD50K (see https://zenodo.org/record/4060432).
-    """
-    dataset_directory = pathlib.Path(dataset_directory)
-    if not dataset_directory.joinpath('dataframe.csv').exists():
-
-        # merge separate dev and eval sets into one big table
-        df1 = pd.read_csv(next(dataset_directory.rglob('dev.csv')))
-        df2 = pd.read_csv(next(dataset_directory.rglob('eval.csv')))
-        df2['split'] = 'test'
-        df = pd.concat([df1, df2])
-
-        durations, filepaths = [], []
-        for row in df.itertuples():
-            subdir = ('FSD50K.eval_audio' if row.split == 'test'
-                      else 'FSD50K.dev_audio')
-            filepath = dataset_directory.joinpath(subdir, str(row.fname)+'.wav')
-            if not filepath.exists():
-                raise ValueError(f'{filepath} does not exist.')
-            duration = len(wav_read(filepath)) / _sample_rate
-            durations.append(duration)
-            filepaths.append(filepath)
-        df['filepath'] = filepaths
-        df['duration'] = durations
-        if not len(filepaths):
-            raise ValueError(f'Could not find any .WAV files within '
-                             f'{dataset_directory}.')
-        columns = list(df.columns)
-        df.to_csv(dataset_directory.joinpath('dataframe.csv'),
-              header=columns,
-              index=False,
-              index_label=False)
-    else:
-        df = pd.read_csv(dataset_directory.joinpath('dataframe.csv'))
-
-    # omit sounds labeled as containing speech or music
-    df['labels'] = df['labels'].apply(str.lower)
-    df = df[~df['labels'].str.contains('speech')]
-    df = df[~df['labels'].str.contains('music')]
-
-    # omit recordings which are smaller than an example
-    df = df.query('duration >= @_example_duration')
-
-    # remove the label ids for convenience
-    del df['mids']
-
-    # shuffle the recordings, then organize by split
-    df = df.sample(frac=1, random_state=0)
-    df['split'] = pd.Categorical(df['split'], ['train', 'val', 'test'])
-    df = df.sort_values('split')
-
-    return df.reset_index(drop=True)
-
-
-def count_parameters(network: torch.nn.Module):
-    return sum(
-        p.numel() for p in network.parameters()
-        if p.requires_grad
-    )
-
-
 def get_personalized_dataset(
-    test_speaker: Union[int, str],
-    environment_snr_db: Union[float, Tuple[float, float]],
-    num_environments: int = 1):
-
+        speaker_id: Union[int, str],
+        environment_snr_db: Union[float, Tuple[float, float]],
+        num_environments: int = 1):
     # build test set
     rng = np.random.default_rng(0)
 
     # retrieve datasets
-    S_te = load_librispeech().query('subset_id == "test-clean"')
+    S_te = exd.dataframe_librispeech().query('subset_id == "test-clean"')
     S_te = S_te[['speaker_id', 'filepath', 'duration']]
     test_speakers = S_te['speaker_id'].astype(str).unique()
-    test_speaker = str(test_speaker)
+    test_speaker = str(speaker_id)
     if test_speaker not in test_speakers:
         raise ValueError(f'Invalid test speaker ID: {test_speaker}.')
-    M = load_demand()
+    M = exd.dataframe_demand()
 
     # map each speaker to one or multiple environments
     if num_environments < 1 or not isinstance(num_environments, int):
@@ -755,9 +67,9 @@ def get_personalized_dataset(
     utterance_list = S_te.query('speaker_id == @test_speaker')
     utterance_list = utterance_list.sort_values('duration').reset_index()
     utterance_list['cumsum'] = utterance_list['duration'].cumsum()
-    split_te = (utterance_list['cumsum']-30).abs().idxmin()
-    split_vl = (utterance_list['cumsum']-60).abs().idxmin()
-    split_ft = (utterance_list['cumsum']-120).abs().idxmin()
+    split_te = (utterance_list['cumsum'] - 30).abs().idxmin()
+    split_vl = (utterance_list['cumsum'] - 60).abs().idxmin()
+    split_ft = (utterance_list['cumsum'] - 120).abs().idxmin()
     u_te = utterance_list.iloc[0:split_te]
     u_vl = utterance_list.iloc[split_te:split_vl]
     u_ft = utterance_list.iloc[split_vl:split_ft]
@@ -765,18 +77,18 @@ def get_personalized_dataset(
 
     # load all the speaker audio and concatenate it into a
     # single long vector
-    s_te = np.concatenate([wav_read(f) for f in u_te.filepath])
-    s_vl = np.concatenate([wav_read(f) for f in u_vl.filepath])
-    s_ft = np.concatenate([wav_read(f) for f in u_ft.filepath])
-    s_tr = np.concatenate([wav_read(f) for f in u_tr.filepath])
+    s_te = np.concatenate([exd.wav_read(f) for f in u_te.filepath])
+    s_vl = np.concatenate([exd.wav_read(f) for f in u_vl.filepath])
+    s_ft = np.concatenate([exd.wav_read(f) for f in u_ft.filepath])
+    s_tr = np.concatenate([exd.wav_read(f) for f in u_tr.filepath])
     s = np.concatenate([s_te, s_vl, s_ft, s_tr])
 
     # load the premixture noise profile
     env_indices = env_mapping[test_speaker]
     if num_environments == 1:
-        p = wav_read(M.iloc[env_indices]['filepath'])
+        p = exd.wav_read(M.iloc[env_indices]['filepath'])
     else:
-        p = np.stack([wav_read(f) for f in
+        p = np.stack([exd.wav_read(f) for f in
                       M.iloc[env_indices]['filepath']])
 
     # segment the premixture noise similarly
@@ -790,7 +102,7 @@ def get_personalized_dataset(
 
     # circularly loop the training premixture noise if it is
     # too short
-    tile_count = -(-s_tr.shape[-1]//p_tr.shape[-1])
+    tile_count = -(-s_tr.shape[-1] // p_tr.shape[-1])
     if num_environments == 1:
         p_tr = np.tile(p_tr, tile_count)
     else:
@@ -800,15 +112,15 @@ def get_personalized_dataset(
 
     # get the correct mixing scalar based on the overall
     # energies of the speech and premixture datasets
-    energy_s = np.sum(s**2, axis=-1, keepdims=True)
-    energy_n = np.sum(p**2, axis=-1, keepdims=True)
+    energy_s = np.sum(s ** 2, axis=-1, keepdims=True)
+    energy_n = np.sum(p ** 2, axis=-1, keepdims=True)
     snr_db = np.mean(environment_snr_db)
-    b = np.sqrt((energy_s/energy_n)*(10**(-snr_db/10.)))
+    b = np.sqrt((energy_s / energy_n) * (10 ** (-snr_db / 10.)))
 
     # combine all the signals
-    x_tr = s_tr + b*p_tr
-    x_vl = s_vl + b*p_vl
-    x_te = s_te + b*p_te
+    x_tr = s_tr + b * p_tr
+    x_vl = s_vl + b * p_vl
+    x_te = s_te + b * p_te
 
     if num_environments == 1:
         environments = [M.iloc[env_indices]['location_id']]
@@ -833,12 +145,13 @@ def get_personalized_dataset(
 
 @torch.no_grad()
 def test_model(
-    model: torch.nn.Module,
-    test_speaker: Optional[Union[int, str]] = None,
-    environment_snr_db: Union[float, Tuple[float, float]] = 0,
-    num_environments: int = 1):
+        model: torch.nn.Module,
+        test_speaker: Optional[Union[int, str]] = None,
+        environment_snr_db: Union[float, Tuple[float, float]] = 0,
+        num_environments: int = 1):
     """Evaluates a speech enhancement model on one or many test set speakers.
     """
+
     def _run_test(model, test_speaker, environment_snr_db, num_environments):
         dataset = get_personalized_dataset(
             test_speaker, environment_snr_db, num_environments)
@@ -850,10 +163,10 @@ def test_model(
             s_te = s_te.unsqueeze(0)
             x_te = x_te.unsqueeze(0)
         s_hat_te = model(x_te)
-        return float(sisdr_improvement(s_hat_te, s_te, x_te).mean())
+        return float(exd.sisdr_improvement(s_hat_te, s_te, x_te).mean())
 
     if test_speaker == None:
-        S_te = load_librispeech().query('subset_id == "test-clean"')
+        S_te = exd.dataframe_librispeech().query('subset_id == "test-clean"')
         S_te = S_te[['speaker_id', 'filepath', 'duration']]
         test_speakers = sorted(S_te['speaker_id'].astype(str).unique())
     else:
@@ -867,10 +180,10 @@ def test_model(
 
 @torch.no_grad()
 def test_checkpoint(
-    checkpoint_path: Union[str, os.PathLike],
-    test_speaker: Optional[Union[int, str]] = None,
-    environment_snr_db: Union[float, Tuple[float, float]] = 0,
-    num_environments: int = 1):
+        checkpoint_path: Union[str, os.PathLike],
+        test_speaker: Optional[Union[int, str]] = None,
+        environment_snr_db: Union[float, Tuple[float, float]] = 0,
+        num_environments: int = 1):
     """
     """
     # load a config yaml file which should be in the same location
@@ -878,8 +191,8 @@ def test_checkpoint(
     if not yaml_file.exists():
         raise ValueError(f'Could not find {str(yaml_file)}.')
     with open(yaml_file, 'r') as fp:
-        config = yaml.load(fp, Loader=yaml.FullLoader)
-    model, _ = init_model(config)
+        config = yaml.safe_load(fp)
+    model = exm.init_model(config)[0]
     checkpoint_obj = torch.load(checkpoint_path)
     model_state_dict = checkpoint_obj['model_state_dict']
     model.load_state_dict(model_state_dict, strict=True)
@@ -902,12 +215,12 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None,
                          f'{set(expected_config.keys())}')
     config['batch_size'] = config.get('batch_size', _batch_size)
     config['val_batch_size'] = config.get('val_batch_size', _val_batch_size)
-    config['sample_rate'] = config.get('sample_rate', _sample_rate)
+    config['sample_rate'] = config.get('sample_rate', exd.sample_rate)
     config['example_duration'] = config.get('example_duration',
-        _example_duration)
+                                            exd.example_duration)
 
     # prepare neural net, optimizer, and loss function
-    model, model_config = init_model(config)
+    model, model_nparams, model_config = exm.init_model(config)
     model = model.cuda()
     config['model_config'] = model_config
     optimizer = torch.optim.Adam(params=model.parameters(),
@@ -923,10 +236,10 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None,
         init_step = ckpt['step']
 
     # pick up dataset splits
-    S = load_librispeech()
+    S = exd.dataframe_librispeech()
     S_tr = S.query('subset_id == "train-clean-100"')
     S_vl = S.query('subset_id == "dev-clean"')
-    N = load_fsd50k()
+    N = exd.dataframe_fsd50k()
     N_tr = N.query('split == "train"')
     N_vl = N.query('split == "val"')
 
@@ -934,9 +247,9 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None,
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
     output_directory = pathlib.Path('runs').joinpath(
         current_time + '_' + trial_name(config=config))
-    writer = SummaryWriter(output_directory)
+    writer = SummaryWriter(str(output_directory))
     with open(output_directory.joinpath('config.yaml'), 'w',
-        encoding='utf-8') as fp:
+              encoding='utf-8') as fp:
         yaml.dump(config, fp)
         print(yaml.dump(config, default_flow_style=False))
 
@@ -944,6 +257,7 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None,
     min_loss, min_loss_step = np.inf, 0
 
     # training loop
+    step: int = init_step
     print(f'Output Directory: {output_directory}')
     try:
         for step in itertools.count(init_step):
@@ -953,15 +267,15 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None,
 
                 # circularly index the datasets
                 indices = np.arange(_batch_size * step,
-                    _batch_size * (step + 1), 1)
-                s = wav_read_multiple(S_tr.filepath[indices % len(S_tr)])
-                n = wav_read_multiple(N_tr.filepath[indices % len(N_tr)])
+                                    _batch_size * (step + 1), 1)
+                s = exd.wav_read_multiple(S_tr.filepath[indices % len(S_tr)])
+                n = exd.wav_read_multiple(N_tr.filepath[indices % len(N_tr)])
 
                 # mix the signals up at random snrs
                 snrs = _rng.uniform(low=config['mixture_snr'][0],
                                     high=config['mixture_snr'][1],
                                     size=(_batch_size, 1))
-                x = mix_signals(s, n, snrs)
+                x = exd.mix_signals(s, n, snrs)
 
                 # convert to tensors
                 s = torch.from_numpy(s).float().cuda()
@@ -979,7 +293,7 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None,
                         loss_tr = criterion(s_hat, _s).mean()
                         (loss_tr / _batch_size).backward()
                         with torch.no_grad():
-                            sisdri_tr += sisdr_improvement(s_hat, _s, _x).mean()
+                            sisdri_tr += exd.sisdr_improvement(s_hat, _s, _x).mean()
                     sisdri_tr /= _batch_size
                 else:
                     s_hat = model(x)
@@ -988,7 +302,7 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None,
                     loss_tr = criterion(s_hat, s).mean()
                     loss_tr.backward()
                     with torch.no_grad():
-                        sisdri_tr = sisdr_improvement(s_hat, s, x).mean()
+                        sisdri_tr = exd.sisdr_improvement(s_hat, s, x).mean()
 
                 # back propagation
                 optimizer.step()
@@ -1004,18 +318,18 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None,
             model.eval()
             with torch.no_grad():
 
-                s = wav_read_multiple(S_vl.filepath[0:_val_batch_size])
-                n = wav_read_multiple(N_vl.filepath[0:_val_batch_size])
-                x = mix_signals(s, n, np.mean(config['mixture_snr']))
+                s = exd.wav_read_multiple(S_vl.filepath[0:_val_batch_size])
+                n = exd.wav_read_multiple(N_vl.filepath[0:_val_batch_size])
+                x = exd.mix_signals(s, n, float(np.mean(config['mixture_snr'])))
                 loss_vl, sisdri_vl = [], []
                 for i in range(0, _val_batch_size, _batch_size):
-                    _s = torch.from_numpy(s[i:i+_batch_size]).float().cuda()
-                    _x = torch.from_numpy(x[i:i+_batch_size]).float().cuda()
+                    _s = torch.from_numpy(s[i:i + _batch_size]).float().cuda()
+                    _x = torch.from_numpy(x[i:i + _batch_size]).float().cuda()
                     s_hat = model(_x)
                     if len(s_hat.shape) == 3:
                         s_hat = s_hat[:, 0]
                     loss_vl.append(float(criterion(s_hat, _s).mean()))
-                    sisdri_vl.append(float(sisdr_improvement(s_hat, _s, _x).mean()))
+                    sisdri_vl.append(float(exd.sisdr_improvement(s_hat, _s, _x).mean()))
                 loss_vl, sisdri_vl = np.mean(loss_vl), np.mean(sisdri_vl)
                 writer.add_scalar('MSELoss/validation', float(loss_vl), step)
                 writer.add_scalar('SISDRi/validation', float(sisdri_vl), step)
@@ -1081,12 +395,12 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
                          f'{set(expected_config.keys())}')
     config['batch_size'] = config.get('batch_size', _batch_size)
     config['val_batch_size'] = config.get('val_batch_size', _val_batch_size)
-    config['sample_rate'] = config.get('sample_rate', _sample_rate)
+    config['sample_rate'] = config.get('sample_rate', exd.sample_rate)
     config['example_duration'] = config.get('example_duration',
-        _example_duration)
+                                            exd.example_duration)
 
     # prepare neural net, optimizer, and loss function
-    model, model_config = init_model(config)
+    model, model_nparams, model_config = exm.init_model(config)
     model = model.cuda()
     config['model_config'] = model_config
     optimizer = torch.optim.Adam(params=model.parameters(),
@@ -1095,10 +409,11 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
 
     # instantiate SNR predictor and segmental loss function if needed
     if config['use_purification_loss']:
-        criterion = SegmentalLoss('mse', reduction='mean')
-        predictor = SNRPredictor()
+        criterion = exm.SegmentalLoss('mse', reduction='mean')
+        predictor = exm.SNRPredictor()
         predictor.load_state_dict(torch.load('snr_predictor'), strict=False)
-        predictor = predictor.cuda()
+        predictor.cuda()
+        predictor.eval()
 
     # load a previous checkpoint if provided
     init_step = 0
@@ -1120,7 +435,7 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
     P_vl = dataset['val_premixture']
     if len(P_vl.shape) == 1:
         P_vl = P_vl[np.newaxis, ...]
-    N = load_fsd50k()
+    N = exd.dataframe_fsd50k()
     N_tr = N.query('split == "train"')
     N_vl = N.query('split == "val"')
 
@@ -1137,16 +452,16 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
         s = []
         for j in range(size):
             start = int(starting_sample_indices[j])
-            s.append(data[env_indices[j], start:start+l])
+            s.append(data[env_indices[j], start:start + l])
         return np.stack(s)
 
     # instantiate tensorboard
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
     output_directory = pathlib.Path('runs').joinpath(
         current_time + '_' + trial_name(config=config))
-    writer = SummaryWriter(output_directory)
+    writer = SummaryWriter(str(output_directory))
     with open(output_directory.joinpath('config.yaml'), 'w',
-        encoding='utf-8') as fp:
+              encoding='utf-8') as fp:
         yaml.dump(config, fp)
         print(yaml.dump(config, default_flow_style=False))
 
@@ -1164,14 +479,14 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
                 # sample speech from the premixture data
                 s = sample_premixture(P_tr)
                 indices = np.arange(config['batch_size'] * step,
-                    config['batch_size'] * (step + 1), 1)
-                n = wav_read_multiple(N_tr.filepath[indices % len(N_tr)])
+                                    config['batch_size'] * (step + 1), 1)
+                n = exd.wav_read_multiple(N_tr.filepath[indices % len(N_tr)])
 
                 # mix the signals up at random snrs
                 snrs = _rng.uniform(low=config['mixture_snr'][0],
                                     high=config['mixture_snr'][1],
                                     size=(config['batch_size'], 1))
-                x = mix_signals(s, n, snrs)
+                x = exd.mix_signals(s, n, snrs)
 
                 # convert to tensors
                 s = torch.from_numpy(s).float().cuda()
@@ -1187,26 +502,26 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
                         if len(s_hat.shape) == 3:
                             s_hat = s_hat[:, 0]
                         if config['use_purification_loss']:
-                            w = _logistic(predictor(_s))
+                            w = predictor(_s)
                             loss_tr = criterion(s_hat, _s, w).mean()
                         else:
                             loss_tr = criterion(s_hat, _s).mean()
                         (loss_tr / _batch_size).backward()
                         with torch.no_grad():
-                            sisdri_tr += sisdr_improvement(s_hat, _s, _x).mean()
+                            sisdri_tr += exd.sisdr_improvement(s_hat, _s, _x).mean()
                     sisdri_tr /= _batch_size
                 else:
                     s_hat = model(x)
                     if len(s_hat.shape) == 3:
                         s_hat = s_hat[:, 0]
                     if config['use_purification_loss']:
-                        w = _logistic(predictor(s))
+                        w = predictor(s)
                         loss_tr = criterion(s_hat, s, w).mean()
                     else:
                         loss_tr = criterion(s_hat, s).mean()
                     loss_tr.backward()
                     with torch.no_grad():
-                        sisdri_tr = sisdr_improvement(s_hat, s, x).mean()
+                        sisdri_tr = exd.sisdr_improvement(s_hat, s, x).mean()
 
                 # back propagation
                 optimizer.step()
@@ -1216,24 +531,24 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
                 writer.add_scalar('MSELoss/train', float(loss_tr), step)
                 writer.add_scalar('SISDRi/train', float(sisdri_tr), step)
 
-            if (step % config.get('validate_every', 100)):
+            if step % config.get('validate_every', 100):
                 continue
 
             model.eval()
             with torch.no_grad():
 
                 s = sample_premixture(P_vl, _val_batch_size)
-                n = wav_read_multiple(N_vl.filepath[0:_val_batch_size])
-                x = mix_signals(s, n, np.mean(config['mixture_snr']))
+                n = exd.wav_read_multiple(N_vl.filepath[0:_val_batch_size])
+                x = exd.mix_signals(s, n, float(np.mean(config['mixture_snr'])))
                 loss_vl, sisdri_vl = [], []
                 for i in range(0, _val_batch_size, _batch_size):
-                    _s = torch.from_numpy(s[i:i+_batch_size]).float().cuda()
-                    _x = torch.from_numpy(x[i:i+_batch_size]).float().cuda()
+                    _s = torch.from_numpy(s[i:i + _batch_size]).float().cuda()
+                    _x = torch.from_numpy(x[i:i + _batch_size]).float().cuda()
                     s_hat = model(_x)
                     if len(s_hat.shape) == 3:
                         s_hat = s_hat[:, 0]
                     loss_vl.append(float(criterion(s_hat, _s).mean()))
-                    sisdri_vl.append(float(sisdr_improvement(s_hat, _s, _x).mean()))
+                    sisdri_vl.append(float(exd.sisdr_improvement(s_hat, _s, _x).mean()))
                 loss_vl, sisdri_vl = np.mean(loss_vl), np.mean(sisdri_vl)
                 writer.add_scalar('MSELoss/validation', float(loss_vl), step)
                 writer.add_scalar('SISDRi/validation', float(sisdri_vl), step)
@@ -1253,12 +568,12 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
                 if (step - min_loss_step) > patience:
                     raise EarlyStopping()
 
-    except EarlyStopping as e:
+    except EarlyStopping:
         print(f'Automatically exited with patience for {patience} steps; '
               f'best step was {min_loss_step}.')
         pass
 
-    except KeyboardInterrupt as e:
+    except KeyboardInterrupt:
         print(f'Manually exited at step {step}; '
               f'best step was {min_loss_step}.')
         torch.save({
@@ -1278,7 +593,7 @@ def train_unsup(config: dict, checkpoint_path: Optional[str] = None,
     return
 
 
-def trial_name(trial = None, config: Optional[dict] = None):
+def trial_name(trial=None, config: Optional[dict] = None):
     if trial:
         config = trial.config
     elif not config:
@@ -1302,25 +617,25 @@ def trial_name(trial = None, config: Optional[dict] = None):
 
 
 if __name__ == '__main__':
-    # train_sup(dict(
-    #     learning_rate=1e-4,
-    #     model_name='convtasnet',
-    #     model_size='medium',
-    #     training_procedure='sup',
-    #     mixture_snr=(-10, 10)
-    # ))
-    S_te = load_librispeech().query('subset_id == "test-clean"')
-    test_speakers = sorted(S_te['speaker_id'].astype(str).unique())
-    for test_speaker in test_speakers:
-        train_unsup(dict(
-            learning_rate=1e-4,
-            model_name='grunet',
-            model_size='small',
-            training_procedure='unsup+dp',
-            use_contrastive_loss=False,
-            use_purification_loss=True,
-            test_speaker=test_speaker,
-            num_environments=1,
-            environment_snr_db=5,
-            mixture_snr=(-10, 10)
-        ))
+    train_sup(dict(
+        learning_rate=1e-4,
+        model_name='grunet',
+        model_size='small',
+        training_procedure='sup',
+        mixture_snr=(-10, 10)
+    ))
+    # S_te = exd.dataframe_librispeech().query('subset_id == "test-clean"')
+    # test_speakers = sorted(S_te['speaker_id'].astype(str).unique())
+    # for test_speaker in test_speakers:
+    #     train_unsup(dict(
+    #         learning_rate=1e-4,
+    #         model_name='grunet',
+    #         model_size='small',
+    #         training_procedure='unsup+dp',
+    #         use_contrastive_loss=False,
+    #         use_purification_loss=True,
+    #         test_speaker=test_speaker,
+    #         num_environments=1,
+    #         environment_snr_db=5,
+    #         mixture_snr=(-10, 10)
+    #     ))
