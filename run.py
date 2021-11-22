@@ -7,13 +7,13 @@ from typing import Optional
 from typing import Tuple
 from typing import Union
 
-import exp_data as exd
-import exp_models as exm
-
 import numpy as np
 import torch
 import yaml
 from torch.utils.tensorboard import SummaryWriter
+
+import exp_data as exd
+import exp_models as exm
 
 warnings.filterwarnings('ignore')
 
@@ -207,8 +207,10 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None,
     # verify config
     expected_config = {
         'learning_rate': float,
-        'model_name': str, 'model_size': str,
-        'mixture_snr': Tuple[float, float],
+        'model_name': str,
+        'model_size': str,
+        'snr_mixture_min': float,
+        'snr_mixture_max': float,
     }
     if not set(expected_config.keys()).issubset(set(config.keys())):
         raise ValueError(f'Expected `config` to contain keys: '
@@ -272,8 +274,8 @@ def train_sup(config: dict, checkpoint_path: Optional[str] = None,
                 n = exd.wav_read_multiple(N_tr.filepath[indices % len(N_tr)])
 
                 # mix the signals up at random snrs
-                snrs = _rng.uniform(low=config['mixture_snr'][0],
-                                    high=config['mixture_snr'][1],
+                snrs = _rng.uniform(low=config['snr_mixture_min'],
+                                    high=config['snr_mixture_max'],
                                     size=(_batch_size, 1))
                 x = exd.mix_signals(s, n, snrs)
 
@@ -622,7 +624,8 @@ if __name__ == '__main__':
         model_name='grunet',
         model_size='small',
         training_procedure='sup',
-        mixture_snr=(-10, 10)
+        snr_mixture_min=-10,
+        snr_mixture_max=10,
     ))
     # S_te = exd.dataframe_librispeech().query('subset_id == "test-clean"')
     # test_speakers = sorted(S_te['speaker_id'].astype(str).unique())
