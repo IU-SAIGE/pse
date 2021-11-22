@@ -10,6 +10,7 @@ import torch
 from asteroid.losses.sdr import singlesrc_neg_sisdr
 from asteroid.losses.sdr import singlesrc_neg_snr
 from torch.utils.data import IterableDataset
+from torch.utils.data._utils.collate import default_collate
 
 example_duration: float = 4
 sample_rate: int = 16000
@@ -707,16 +708,26 @@ class Mixtures(IterableDataset):
     def __iter__(self) -> IterableDataset:
         return self
 
-    def __getitem__(self, seed: Optional[int] = None):
-        return next(self, seed)
+    def __getitem__(self, key: Union[int, slice]):
+        if isinstance(key, slice):
+            indices = range(key.start, key.stop, key.step or 1)
+            out = default_collate([self.get_example(k) for k in indices])
+        elif isinstance(key, int):
+            out = self.get_example(key)
+        else:
+            raise TypeError(f'Index must be int, not {type(key).__name__}.')
+        return out
 
-    def __next__(self, seed: Optional[int] = None):
+    def __next__(self):
+        return self.get_example()
 
-        if seed is None:
+    def get_example(self, seed: Optional[int] = None):
+
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        else:
             self.index += 1
             self.rng = np.random.default_rng(self.index)
-        else:
-            self.rng = np.random.default_rng(seed)
 
         # slice from speech array, randomly offset, truncate, normalize, and mix
         if self.is_personalized:
