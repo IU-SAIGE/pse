@@ -1,12 +1,12 @@
+from typing import Optional, Set, Tuple
+
 import asteroid.models
 import numpy as np
 import torch
 import torch.nn.functional as tf
-
-from typing import Optional, Set, Tuple
 from torch.nn.modules.loss import _Loss
-from exp_data import sample_rate
 
+from exp_data import sample_rate
 
 _fft_size: int = 1024
 _hop_size: int = 256

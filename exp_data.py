@@ -1,6 +1,6 @@
 import os
 import pathlib
-from typing import Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import librosa
 import numpy as np
@@ -9,6 +9,7 @@ import soundfile as sf
 import torch
 from asteroid.losses.sdr import singlesrc_neg_sisdr
 from asteroid.losses.sdr import singlesrc_neg_snr
+from torch.utils.data import IterableDataset
 
 example_duration: float = 4
 sample_rate: int = 16000
@@ -18,6 +19,7 @@ _root_demand: str = '/data/asivara/demand_1ch/'
 _root_fsd50k: str = '/data/asivara/fsd50k_16khz/'
 _root_musan: str = '/data/asivara/musan/'
 
+_eps: float = 1e-8
 _rng = np.random.default_rng(0)
 
 
@@ -86,23 +88,21 @@ def wav_read(
     if sr != sample_rate:
         raise IOError(f'Expected sample_rate={sample_rate}, got {sr}.')
     # always pick up the first channel
-    y = y[..., 0]
+    y = np.array(y[..., 0])
     return y, float(len(y) / sample_rate)
 
 
 def wav_read_multiple(
         filepaths: Sequence[Union[str, os.PathLike]],
-        sample_within: bool = True
+        concatenate: bool = False
 ) -> np.ndarray:
-    """Loads multiple audio signals from file and stacks them up as a batch.
-    If `sample_within` is True, randomly offsets and truncates signals to
-    equal length, i.e. the original audio signals may be variable-length.
+    """Loads multiple audio signals from file; may be batched or concatenated.
     """
     signals = []
     min_length = int(example_duration * sample_rate)
     for filepath in filepaths:
         s, duration = wav_read(filepath)
-        if sample_within:
+        if not concatenate:
             if duration < example_duration:
                 raise ValueError(f'Expected {filepath} to have minimum duration'
                                  f'of {example_duration} seconds.')
@@ -115,11 +115,7 @@ def wav_read_multiple(
                 raise e
             s = s[offset:offset + min_length]
         signals.append(s)
-        if len(signals) > 1:
-            if len(signals[-1]) != len(signals[-2]):
-                raise ValueError('If sample_within=False, all signals '
-                                 'should have equal length.')
-    return np.stack(signals, axis=0)
+    return np.concatenate(signals) if concatenate else np.stack(signals, axis=0)
 
 
 def sisdr(
@@ -229,31 +225,78 @@ def dataframe_librispeech(
     if omit_clipped:
         # discard recordings from speakers who possess clipped recordings
         # (manually found using SoX, where 'volume adjustment' == 1.000)
-        clipped_speakers = ['101', '1069', '1175', '118', '1290', '1379',
-                            '1456', '1552', '1578', '1629', '1754', '1933', '1943', '1963',
-                            '198', '204', '2094', '2113', '2149', '22', '2269', '2618', '2751',
-                            '307', '3168', '323', '3294', '3374', '345', '3486', '3490', '3615',
-                            '3738', '380', '4148', '446', '459', '4734', '481', '5002', '5012',
-                            '5333', '549', '5561', '5588', '559', '5678', '5740', '576', '593',
-                            '6295', '6673', '7139', '716', '7434', '7800', '781', '8329',
-                            '8347', '882']
+        clipped_speakers = [
+            '101', '1069', '1175', '118', '1290', '1379', '1456', '1552',
+            '1578', '1629', '1754', '1933', '1943', '1963', '198', '204',
+            '2094', '2113', '2149', '22', '2269', '2618', '2751', '307',
+            '3168', '323', '3294', '3374', '345', '3486', '3490', '3615',
+            '3738', '380', '4148', '446', '459', '4734', '481', '5002',
+            '5012', '5333', '549', '5561', '5588', '559', '5678', '5740',
+            '576', '593', '6295', '6673', '7139', '716', '7434', '7800',
+            '781', '8329', '8347', '882'
+        ]
         df = df[~df['speaker_id'].isin(clipped_speakers)]
 
     # omit recordings which are smaller than an example
     df = df.query('duration >= @example_duration')
 
+    # organize by split
+    def assign_split_per_speaker(
+            sgroup,
+            duration_s_test: int = 30,
+            duration_s_validation: int = 30,
+            duration_s_train: int = 60,
+            duration_s_prevalidation: int = 30,
+    ):
+        # designate partition indices based on the nearest cumulative duration
+        sp_id = set(sgroup['speaker_id']).pop()
+        cs = sgroup['duration'].cumsum()
+        offset = min(sgroup.index)
+        _d = duration_s_test
+        split_te = (cs - _d).abs().idxmin() - offset
+        _d += duration_s_validation
+        split_vl = (cs - _d).abs().idxmin() - offset
+        if split_vl == split_te: split_vl += 1
+        _d += duration_s_train
+        split_tr = (cs - _d).abs().idxmin() - offset
+        if split_tr == split_vl: split_tr += 1
+        _d += duration_s_prevalidation
+        split_pvl = (cs - _d).abs().idxmin() - offset
+        if split_pvl == split_tr: split_pvl += 1
+
+        assert (split_te != split_vl), (sp_id, split_te, split_vl)
+        assert (split_vl != split_tr), (sp_id, split_vl, split_tr)
+        assert (split_tr != split_pvl), (sp_id, split_tr, split_pvl)
+
+        # assign split
+        sgroup.iloc[0:split_te]['split'] = 'test'
+        sgroup.iloc[split_te:split_vl]['split'] = 'val'
+        sgroup.iloc[split_vl:split_tr]['split'] = 'train'
+        sgroup.iloc[split_tr:split_pvl]['split'] = 'preval'
+
+        # return the modified speaker group
+        return sgroup
+
+    df = df.assign(split='pretrain').sort_values(['speaker_id', 'duration'])
+    g = df.reset_index(drop=True).groupby('speaker_id')
+    df = g.apply(assign_split_per_speaker)
+
     # shuffle the recordings
     df = df.sample(frac=1, random_state=0)
 
-    # organize by split
+    # organize by subset and split
     df['subset_id'] = pd.Categorical(df['subset_id'], valid_subsets)
-    df = df.sort_values('subset_id')
+    df['split'] = pd.Categorical(df['split'], ['pretrain', 'preval', 'train',
+                                               'val', 'test'])
+    df = df.sort_values(['subset_id', 'split'])
 
     # ensure that all the audio files exist
     if not all(df.filepath.apply(os.path.isfile)):
         raise ValueError(f'Audio files missing, check {dataset_directory}.')
 
     # reindex and name the dataframe
+    df = df[['filepath', 'subset_id', 'speaker_id',
+             'split', 'duration', 'sparsity']]
     df = df.reset_index(drop=True)
     df.index.name = 'LIBRISPEECH'
     return df
@@ -339,6 +382,7 @@ def dataframe_demand(
         raise ValueError(f'Audio files missing, check {dataset_directory}.')
 
     # reindex and name the dataframe
+    df = df[['filepath', 'duration', 'sparsity']]
     df = df.reset_index(drop=True)
     df.index.name = 'DEMAND'
     return df
@@ -388,9 +432,6 @@ def dataframe_fsd50k(
     else:
         df = pd.read_csv(dataset_directory.joinpath('dataframe.csv'))
 
-    # remove the label ids for convenience
-    del df['mids']
-
     # omit sounds labeled as containing speech or music
     df['labels'] = df['labels'].apply(str.lower)
     df = df[~df['labels'].str.contains('speech')]
@@ -411,6 +452,7 @@ def dataframe_fsd50k(
         raise ValueError(f'Audio files missing, check {dataset_directory}.')
 
     # reindex and name the dataframe
+    df = df[['filepath', 'split', 'duration', 'sparsity']]
     df = df.reset_index(drop=True)
     df.index.name = 'FSD50K'
     return df
@@ -429,8 +471,8 @@ def dataframe_musan(
     if not dataset_directory.joinpath('dataframe.csv').exists():
         rows = []
         columns = [
-            'split',
             'filepath',
+            'split',
             'duration',
             'sparsity'
         ]
@@ -465,6 +507,268 @@ def dataframe_musan(
         raise ValueError(f'Audio files missing, check {dataset_directory}.')
 
     # reindex and name the dataframe
+    df = df[['filepath', 'split', 'duration', 'sparsity']]
     df = df.reset_index(drop=True)
     df.index.name = 'MUSAN'
     return df
+
+
+def split_speakers(
+        only_tc100: bool = True
+) -> Tuple[List, List, List]:
+    """Splits LibriSpeech speaker IDs into train, validation, and test sets.
+    """
+    df = df_librispeech
+    speakers_vl = pd.read_csv('speakers/validation.csv')
+    speakers_te = pd.read_csv('speakers/test.csv')
+    speakers_tr = df['subset_id'].str.contains('train-clean-100')
+    if not only_tc100:
+        # will use speakers from both the 100hr and 360hr set
+        speakers_tr = df['subset_id'].str.contains('train-clean')
+    sp_ids_vl = set(speakers_vl['speaker_id'])
+    sp_ids_te = set(speakers_te['speaker_id'])
+    sp_ids_tr = set(df[speakers_tr]['speaker_id'])
+    sp_ids_tr -= sp_ids_vl
+    sp_ids_tr -= sp_ids_te
+    return sorted(sp_ids_tr), sorted(sp_ids_vl), sorted(sp_ids_te)
+
+
+def get_noise_corpus(name: str):
+    """Returns a noise corpus DataFrame by name."""
+    return {
+        'musan': df_musan,
+        'fsd50k': df_fsd50k,
+        'demand': df_demand,
+    }.get(name.lower())
+
+
+class Mixtures(IterableDataset):
+    """PyTorch dataset to produce noisy speech signals.
+    """
+
+    def __init__(
+            self,
+            speaker_id_or_ids: Union[int, Sequence[int]],
+            split_speech: str,
+            split_premixture: Optional[str] = 'train',
+            split_mixture: Optional[str] = 'train',
+            corpus_premixture: str = 'fsd50k',
+            corpus_mixture: str = 'musan',
+            snr_premixture: Optional[Union[float, Tuple[float, float]]] = None,
+            snr_mixture: Optional[Union[float, Tuple[float, float]]] = None,
+            dataset_duration: Optional[float] = None,
+    ):
+        # parse and sanity check arguments
+        (
+            self.speaker_ids,
+            self.snr_premixture_min,
+            self.snr_premixture_max,
+            self.snr_mixture_min,
+            self.snr_mixture_max,
+            self.split_speech,
+            self.split_premixture,
+            self.split_mixture,
+            self.dataset_duration
+        ) = self.sanity_check(locals())
+        self.index = 0
+        self.rng = np.random.default_rng(0)
+        self.example_duration = example_duration
+        self.example_length = int(sample_rate * example_duration)
+
+        # instantiate corpora
+        self.corpus_s = df_librispeech.query(
+            f'speaker_id in {self.speaker_ids}')
+        if self.split_speech != 'all':
+            self.corpus_s = self.corpus_s.query(
+                f'split == "{self.split_speech}"')
+        self.corpus_m = get_noise_corpus(corpus_premixture).query(
+            f'split == "{self.split_premixture}"')
+        self.corpus_n = get_noise_corpus(corpus_mixture).query(
+            f'split == "{self.split_mixture}"')
+
+        # calculate maximum random offset for all utterances
+        max_offset_func = lambda d: d.assign(max_offset=(
+                sample_rate * d['duration'] - self.example_length)).astype({
+            'max_offset': int})
+        self.corpus_s = max_offset_func(self.corpus_s)
+        self.corpus_m = max_offset_func(self.corpus_m)
+        self.corpus_n = max_offset_func(self.corpus_n)
+
+        # keep track of the number of utterances, premixture noises,
+        # and injected noises
+        self.len_s = len(self.corpus_s)
+        self.len_m = len(self.corpus_m)
+        self.len_n = len(self.corpus_n)
+        if self.len_s < 1:
+            raise ValueError('Invalid speaker_id')
+
+        # define flags
+        self.is_personalized = bool(len(self.speaker_ids) == 1)
+        self.add_premixture_noise = bool(
+            (snr_premixture is not None) and (self.len_m > 0))
+        self.add_noise = bool(
+            (snr_mixture is not None) and (self.len_n > 0))
+
+        # if dealing with a single-speaker, load all the audio data in advance
+        self.speech_data = np.empty(0)
+        if self.is_personalized:
+            self.speech_data = wav_read_multiple(
+                self.corpus_s.filepath, concatenate=True)
+            # truncate the single-speaker data if specified
+            if self.dataset_duration:
+                max_length = int(sample_rate * self.dataset_duration)
+                self.speech_data = self.speech_data[:max_length]
+
+    @staticmethod
+    def sanity_check(args: dict) -> Tuple[
+        Sequence, Optional[float], Optional[float], Optional[float],
+        Optional[float], str, str, str, Optional[float]
+    ]:
+
+        # verify speaker ID(s)
+        if isinstance(args['speaker_id_or_ids'], int):
+            args['speaker_id_or_ids'] = [args['speaker_id_or_ids']]
+        elif not isinstance(args['speaker_id_or_ids'], (list, set)):
+            raise ValueError('Expected one or a sequence of speaker IDs.')
+        if len(args['speaker_id_or_ids']) < 1:
+            raise ValueError('Expected one or more speaker IDs.')
+        if not set(args['speaker_id_or_ids']).issubset(set(speaker_ids_all)):
+            raise ValueError('Invalid speaker IDs, not found in LibriSpeech.')
+        speaker_ids = args['speaker_id_or_ids']
+
+        # missing pairs of arguments
+        if not args['split_premixture']:
+            if args['snr_premixture'] is not None:
+                raise ValueError('Missing argument `split_premixture`.')
+        if not args['split_mixture']:
+            if args['snr_mixture'] is not None:
+                raise ValueError('Missing argument `split_mixture`.')
+
+        # unpack mixture SNR values
+        if isinstance(args['snr_premixture'], tuple):
+            snr_premixture_min = float(min(args['snr_premixture']))
+            snr_premixture_max = float(max(args['snr_premixture']))
+        elif isinstance(args['snr_premixture'], (float, int)):
+            snr_premixture_min = float(args['snr_premixture'])
+            snr_premixture_max = float(args['snr_premixture'])
+        elif args['snr_premixture'] is None:
+            snr_premixture_min = None
+            snr_premixture_max = None
+        else:
+            raise ValueError('Expected `snr_premixture` to be a float type or '
+                             'a tuple of floats.')
+        if isinstance(args['snr_mixture'], tuple):
+            snr_mixture_min = float(min(args['snr_mixture']))
+            snr_mixture_max = float(max(args['snr_mixture']))
+        elif isinstance(args['snr_mixture'], (float, int)):
+            snr_mixture_min = float(args['snr_mixture'])
+            snr_mixture_max = float(args['snr_mixture'])
+        elif args['snr_mixture'] is None:
+            snr_mixture_min = None
+            snr_mixture_max = None
+        else:
+            raise ValueError('Expected `snr_mixture` to be a float type or '
+                             'a tuple of floats.')
+
+        # verify corpus partitions
+        if not (args['split_speech'] in
+            ('all', 'pretrain', 'preval', 'train', 'val', 'test')):
+            raise ValueError('Expected `split_speech` to be either "all", '
+                             '"pretrain", "preval", "train", "val", or "test".')
+        if args['snr_premixture'] is not None:
+            if not (args['split_premixture'] in ('train', 'val', 'test')):
+                raise ValueError('Expected `split_premixture` to be either '
+                                 '"train", "val", or "test".')
+        if args['snr_mixture'] is not None:
+            if not (args['split_mixture'] in ('train', 'test')):
+                raise ValueError('Expected `split_mixture` to be either '
+                                 '"train" or "test".')
+        split_speech = args['split_speech']
+        split_premixture = args['split_premixture'] or ''
+        split_mixture = args['split_mixture'] or ''
+
+        # verify dataset duration
+        if not isinstance(args['dataset_duration'], (int, float, type(None))):
+            raise ValueError('Expected `dataset_duration` to be a number.')
+        dataset_duration = args['dataset_duration']
+
+        return (
+            speaker_ids,
+            snr_premixture_min,
+            snr_premixture_max,
+            snr_mixture_min,
+            snr_mixture_max,
+            split_speech,
+            split_premixture,
+            split_mixture,
+            dataset_duration
+        )
+
+    def __iter__(self) -> IterableDataset:
+        return self
+
+    def __getitem__(self, seed: Optional[int] = None):
+        return next(self, seed)
+
+    def __next__(self, seed: Optional[int] = None):
+
+        if seed is None:
+            self.index += 1
+            self.rng = np.random.default_rng(self.index)
+        else:
+            self.rng = np.random.default_rng(seed)
+
+        # slice from speech array, randomly offset, truncate, normalize, and mix
+        if self.is_personalized:
+            offset_s = self.rng.integers(low=0, high=max(
+                1, len(self.speech_data) - self.example_length))
+            s = self.speech_data[offset_s:offset_s+self.example_length]
+            assert len(s) == self.example_length
+        else:
+            row = self.corpus_s.iloc[self.index % self.len_s]
+            wav_file = wav_read(row['filepath'])[0]
+            offset_s = self.rng.integers(low=0, high=max(
+                1, row['max_offset'] - self.example_length))
+            s = wav_file[offset_s:offset_s+self.example_length]
+            assert len(s) == self.example_length
+        x = p = s
+
+        if self.add_premixture_noise:
+            row = self.corpus_m.iloc[self.index % self.len_m]
+            wav_file = wav_read(row['filepath'])[0]
+            offset_m = self.rng.integers(low=0, high=max(
+                1, row['max_offset'] - self.example_length))
+            m = wav_file[offset_m:offset_m+self.example_length]
+            assert len(m) == self.example_length
+            snr = self.rng.uniform(self.snr_premixture_min,
+                                   self.snr_premixture_max)
+            x = p = mix_signals(s, m, snr)
+
+        if self.add_noise:
+            row = self.corpus_n.iloc[self.index % self.len_n]
+            wav_file = wav_read(row['filepath'])[0]
+            offset_n = self.rng.integers(low=0, high=max(
+                1, row['max_offset'] - self.example_length))
+            n = wav_file[offset_n:offset_n+self.example_length]
+            assert len(n) == self.example_length
+            snr = self.rng.uniform(self.snr_mixture_min,
+                                   self.snr_mixture_max)
+            x = mix_signals(p, n, snr)
+
+        scale_factor = float(np.abs(x).max() + _eps)
+        return (
+            torch.Tensor(x) / scale_factor,     # mixture signal
+            torch.Tensor(p) / scale_factor,     # premixture signal
+            torch.Tensor(s) / scale_factor,     # source signal
+            # torch.Tensor(segmental_snr(x, s)),  # frame-by-frame SNRs
+        )
+
+# expose corpora and speaker lists
+df_librispeech = dataframe_librispeech()
+df_musan = dataframe_musan()
+df_fsd50k = dataframe_fsd50k()
+df_demand = dataframe_demand()
+speaker_ids_tr, speaker_ids_vl, speaker_ids_te = split_speakers(False)
+speaker_ids_all = speaker_ids_tr + speaker_ids_vl + speaker_ids_te
+speaker_split_durations = df_librispeech.groupby(
+    ['speaker_id', 'split']).agg('sum').duration
