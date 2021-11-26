@@ -1,74 +1,24 @@
-from typing import Optional, Set, Tuple
+import json
+import os
+import pathlib
+from contextlib import nullcontext
+from typing import Optional, Union, Sequence
+from typing import Tuple
 
 import asteroid.models
-import numpy as np
 import torch
 import torch.nn.functional as tf
 from torch.nn.modules.loss import _Loss
 
-from exp_data import sample_rate
+from exp_data import Mixtures, sample_rate, sisdr_improvement, speaker_ids_te, \
+    speaker_ids_tr, speaker_ids_vl, data_te_generalist
+from exp_utils import make_2d, make_3d, pad_x_to_y, shape_reconstructed
 
 _fft_size: int = 1024
 _hop_size: int = 256
 _eps: float = 1e-8
 _recover_noise: bool = False
 _window: torch.Tensor = torch.hann_window(_fft_size)
-
-
-def _make_2d(x: torch.Tensor):
-    """Normalize shape of `x` to two dimensions: [batch, time]."""
-    if isinstance(x, np.ndarray):
-        x = torch.from_numpy(x)
-    if x.ndim == 1:
-        return x.reshape(1, -1)
-    elif x.ndim == 3:
-        return x.squeeze(1)
-    else:
-        if x.ndim != 2: raise ValueError('Could not force 2d.')
-        return x
-
-
-def _make_3d(x: torch.Tensor):
-    """Normalize shape of `x` to three dimensions: [batch, n_chan, time]."""
-    if isinstance(x, np.ndarray):
-        x = torch.from_numpy(x)
-    if x.ndim == 1:
-        return x.reshape(1, 1, -1)
-    elif x.ndim == 2:
-        return x.unsqueeze(1)
-    else:
-        if x.ndim != 3: raise ValueError('Could not force 3d.')
-        return x
-
-
-def _pad_x_to_y(x: torch.Tensor, y: torch.Tensor, axis: int = -1):
-    """Right-pad or right-trim first argument to have same size as second argument
-    Args:
-        x (torch.Tensor): Tensor to be padded.
-        y (torch.Tensor): Tensor to pad `x` to.
-        axis (int): Axis to pad on.
-    Returns:
-        torch.Tensor, `x` padded to match `y`'s shape.
-    """
-    if axis != -1:
-        raise NotImplementedError
-    inp_len = y.shape[axis]
-    output_len = x.shape[axis]
-    return torch.nn.functional.pad(x, [0, inp_len - output_len])
-
-
-def _shape_reconstructed(reconstructed: torch.Tensor, size: torch.Tensor):
-    """Reshape `reconstructed` to have same size as `size`
-    Args:
-        reconstructed (torch.Tensor): Reconstructed waveform
-        size (torch.Tensor): Size of desired waveform
-    Returns:
-        torch.Tensor: Reshaped waveform
-    """
-    if len(size) == 1:
-        return reconstructed.squeeze(0)
-    return reconstructed
-
 
 def _forward_single_mask(self, waveform: torch.Tensor):
     """Custom forward function to do single-mask two-source estimation.
@@ -77,7 +27,7 @@ def _forward_single_mask(self, waveform: torch.Tensor):
     shape = torch.tensor(waveform.shape)
 
     # Reshape to (batch, n_mix, time)
-    waveform = _make_3d(waveform)
+    waveform = make_3d(waveform)
 
     # Real forward
     tf_rep = self.forward_encoder(waveform)
@@ -87,8 +37,8 @@ def _forward_single_mask(self, waveform: torch.Tensor):
     masked_tf_rep = self.apply_masks(tf_rep, est_masks)
     decoded = self.forward_decoder(masked_tf_rep)
 
-    reconstructed = _pad_x_to_y(decoded, waveform)
-    return _shape_reconstructed(reconstructed, shape)
+    reconstructed = pad_x_to_y(decoded, waveform)
+    return shape_reconstructed(reconstructed, shape)
 
 
 def _logistic(v, beta: float = 1., offset: float = 0.):
@@ -325,6 +275,75 @@ class SegmentalLoss(_Loss):
         return losses
 
 
+def feedforward(
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        model: torch.nn.Module,
+        criterion: torch.nn.Module,
+        weights: Optional[torch.Tensor] = None,
+        accumulation: bool = False,
+        validation: bool = False,
+        test: bool = False
+) -> Tuple[torch.Tensor, float]:
+    """Runs a feedforward pass through a model by unraveling batched data.
+    """
+    batch_size = inputs.shape[0]
+    context = torch.no_grad() if (validation or test) else nullcontext()
+    sisdri = 0
+    loss_tensor = torch.Tensor()
+
+    with context:
+        if accumulation:
+            for i in range(batch_size):
+
+                # unravel batch
+                x = inputs[i].unsqueeze(0).cuda()
+                t = targets[i].unsqueeze(0).cuda()
+
+                # forward pass
+                y = make_2d(model(x))
+
+                # backwards pass
+                if not test:
+                    if weights:
+                        w = weights[i].unsqueeze(0)
+                        loss_tensor = criterion(y, t, w).mean()
+                    else:
+                        loss_tensor = criterion(y, t).mean()
+                    loss_tensor /= batch_size
+                if not (validation or test):
+                    loss_tensor.backward()
+
+                # calculate signal improvement
+                sisdri += float(torch.mean(
+                    sisdr_improvement(y, t, x)))
+
+            sisdri /= batch_size
+
+        else:
+
+            # forward pass
+            inputs, targets = inputs.cuda(), targets.cuda()
+            estimates = make_2d(model(inputs))
+
+            # compute loss
+            if not test:
+                if weights:
+                    loss_tensor = criterion(estimates, targets, weights).mean()
+                else:
+                    loss_tensor = criterion(estimates, targets).mean()
+
+            # backwards pass
+            if not (validation or test):
+                loss_tensor.backward()
+
+            # calculate signal improvement
+            sisdri = float(torch.mean(
+                sisdr_improvement(estimates, targets, inputs)))
+
+    return loss_tensor, sisdri
+
+
 def init_ctn(N=512, L=16, B=128, H=512, Sc=128, P=3, X=8, R=3, causal=False):
     model_config = locals()
     return (ConvTasNet(
@@ -357,37 +376,55 @@ def init_dprnn(N=64, L=2, B=128, H=128, R=6, K=250, causal=False):
     ), model_config)
 
 
-def init_model(config: dict) -> Tuple[torch.nn.Module, int, dict]:
+def init_gru(hidden_size=64, num_layers=2):
+    model_config = locals()
+    return (GRUNet(
+        hidden_size=hidden_size,
+        num_layers=num_layers
+    ), model_config)
+
+
+def init_model(
+        model_name: str,
+        model_size: Optional[str] = None,
+        model_config: Optional[dict] = None
+) -> Tuple[torch.nn.Module, int, dict]:
     """Instantiates model based on name and size.
     """
-    # verify config
-    expected_keys: Set[str] = {'model_name', 'model_size'}
-    if not expected_keys.issubset(set(config.keys())):
-        raise ValueError(f'Expected `config` to contain keys: {expected_keys}')
-
     # instantiate network
     model: torch.nn.Module
-    model_config: dict
-    model_name: str = config['model_name']
+    model_config: dict = model_config or {}
+    if not bool(model_size or model_config):
+        raise ValueError('Expected either `model_size` or `model_config`.')
+    if not (model_size in {'small', 'medium', 'large'}):
+        raise ValueError('Size must be either "small", "medium", or "large".')
     if model_name == 'convtasnet':
-        model, model_config = init_ctn(**{
-            'small': dict(X=1, R=1),
-            'medium': dict(X=2, R=1),
-            'large': dict(X=2, R=2)
-        }.get(config['model_size']))
+        if model_config:
+            model, model_config = init_ctn(**model_config)
+        else:
+            model, model_config = init_ctn(**{
+                'small': dict(N=64, H=64, X=2, R=2), # dict(X=1, R=1),
+                'medium': dict(N=128, H=128, X=4, R=2), # dict(X=2, R=1),
+                'large': dict(N=256, H=256, X=4, R=3),
+            }.get(model_size))
     elif model_name == 'dprnntasnet':
-        model, model_config = init_dprnn(**{
-            'small': dict(B=64, H=64, R=1),
-            'medium': dict(B=64, H=64, R=2),
-            'large': dict(B=128, H=128, R=2)
-        }.get(config['model_size']))
+        if model_config:
+            model, model_config = init_dprnn(**model_config)
+        else:
+            model, model_config = init_dprnn(**{
+                'small': dict(B=64, H=64, R=1),
+                'medium': dict(B=64, H=128, R=1),
+                'large': dict(B=128, H=128, R=2)
+            }.get(model_size))
     elif model_name == 'grunet':
-        model_config = dict(hidden_size={
-            'small': 64,
-            'medium': 128,
-            'large': 256
-        }.get(config['model_size']))
-        model = GRUNet(**model_config)
+        if model_config:
+            model, model_config = init_gru(**model_config)
+        else:
+            model, model_config = init_gru(**{
+                'small': dict(hidden_size=64, num_layers=2),
+                'medium': dict(hidden_size=128, num_layers=2),
+                'large': dict(hidden_size=256, num_layers=2)
+            }.get(model_size))
     else:
         raise ValueError(f'Unsupported model name: "{model_name}".')
     model_nparams: int = count_parameters(model)
@@ -398,3 +435,97 @@ def init_model(config: dict) -> Tuple[torch.nn.Module, int, dict]:
 def count_parameters(network: torch.nn.Module):
     return sum(p.numel() for p in network.parameters() if p.requires_grad)
 
+
+@torch.no_grad()
+def test_denoiser_from_module(
+        model: torch.nn.Module,
+        data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
+        accumulation: bool = False
+):
+    """Evaluates speech enhancement model using provided dataset.
+    """
+    if not isinstance(data_te, (list, tuple)):
+        data_te = [data_te]
+    key_tr = repr(speaker_ids_tr)
+    key_vl = repr(speaker_ids_vl)
+    key_te = repr(speaker_ids_te)
+    results = {}
+    for dataset in data_te:
+        batch = dataset(100, seed=0)
+        noop_loss = torch.nn.Identity()
+        key = repr(dataset.speaker_ids)
+        if key == key_tr: key = 'speaker_ids_tr'
+        elif key == key_vl: key = 'speaker_ids_vl'
+        elif key == key_te: key = 'speaker_ids_te'
+        value = feedforward(batch.inputs, batch.targets,
+                            model, noop_loss, None, accumulation, test=True)[1]
+        results[key] = value
+    return results
+
+
+@torch.no_grad()
+def test_denoiser_from_file(
+        checkpoint_path: Union[str, os.PathLike],
+        data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
+        accumulation: bool = False
+):
+    """Evaluates speech enhancement model checkpoint using provided dataset.
+    """
+    # load a config yaml file which should be in the same location
+    config_file = pathlib.Path(checkpoint_path).with_name('config.json')
+    if not config_file.exists():
+        raise ValueError(f'Could not find {str(config_file)}.')
+    with open(config_file, 'r') as fp:
+        config: dict = json.load(fp)
+
+    model = init_model(model_name=config.get('model_name'),
+                       model_size=config.get('model_size'))[0]
+    model.load_state_dict(torch.load(checkpoint_path).get('model_state_dict'),
+                          strict=True)
+    model.cuda()
+
+    return test_denoiser_from_module(model, data_te, accumulation)
+
+
+@torch.no_grad()
+def test_denoiser_from_folder(
+        checkpoint_folder: Union[str, os.PathLike],
+        data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
+        accumulation: bool = False
+):
+    """Selects speech enhancement model checkpoint from folder, and then
+    evaluates using provided dataset.
+    """
+    # identify the best checkpoint using saved text file
+    checkpoint_folder = pathlib.Path(checkpoint_folder)
+    best_step_file = checkpoint_folder.joinpath('best_step.txt')
+    if not best_step_file.exists():
+        raise ValueError(f'Could not find {str(best_step_file)}.')
+    with open(best_step_file, 'r') as fp:
+        best_step = int(fp.readline())
+
+    checkpoint_path = checkpoint_folder.joinpath(f'ckpt_{best_step:08}.pt')
+    if not checkpoint_path.exists():
+        raise IOError(f'{str(checkpoint_path)} does not exist.')
+
+    return test_denoiser_from_file(checkpoint_path, data_te, accumulation)
+
+
+@torch.no_grad()
+def test_denoiser(
+        model: Union[str, os.PathLike, torch.nn.Module],
+        data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
+        accumulation: bool = False
+):
+    if isinstance(model, torch.nn.Module):
+        return test_denoiser_from_module(model, data_te, accumulation)
+    elif isinstance(model, (str, os.PathLike)):
+        path = pathlib.Path(model)
+        if path.is_dir():
+            return test_denoiser_from_folder(path, data_te, accumulation)
+        elif path.is_file():
+            return test_denoiser_from_file(path, data_te, accumulation)
+        else:
+            raise ValueError(f'{str(path)} does not exist.')
+    else:
+        raise ValueError('Expected input to be PyTorch model or filepath.')
