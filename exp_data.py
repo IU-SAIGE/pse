@@ -178,7 +178,7 @@ def sdr_improvement(
     """
     output = (
             sdr(estimate, target, scale_invariant=scale_invariant)
-            - sdr(estimate, mixture, scale_invariant=scale_invariant)
+            - sdr(mixture, target, scale_invariant=scale_invariant)
     )
     if reduction == 'mean':
         output = torch.mean(output)
@@ -480,8 +480,8 @@ def dataframe_musan(
     if not dataset_directory.joinpath('dataframe.csv').exists():
         rows = []
         columns = [
-            'filepath',
             'split',
+            'filepath',
             'duration',
             'sparsity'
         ]
@@ -507,6 +507,14 @@ def dataframe_musan(
 
     # omit recordings which are smaller than an example
     df = df.query('duration >= @example_duration')
+
+    # set aside the last sixty training signals for validation
+    val_indices = df.query('split == "train"').iloc[-60:].index
+    df.loc[val_indices, 'split'] = 'val'
+
+    # organize by subset and split
+    df['split'] = pd.Categorical(df['split'], ['train', 'val', 'test'])
+    df = df.sort_values(['split'])
 
     # shuffle the recordings
     df = df.sample(frac=1, random_state=0)
@@ -559,7 +567,7 @@ class Mixtures:
     def __init__(
             self,
             speaker_id_or_ids: Union[int, Sequence[int]],
-            split_speech: str,
+            split_speech: Optional[str] = 'all',
             split_premixture: Optional[str] = 'train',
             split_mixture: Optional[str] = 'train',
             corpus_premixture: str = 'fsd50k',
@@ -578,6 +586,15 @@ class Mixtures:
         if not set(speaker_id_or_ids).issubset(set(speaker_ids_all)):
             raise ValueError('Invalid speaker IDs, not found in LibriSpeech.')
         self.speaker_ids = speaker_id_or_ids
+        self.speaker_ids_repr = ''
+        if set(self.speaker_ids) == set(speaker_ids_tr):
+            self.speaker_ids_repr = 'speaker_ids_tr'
+        elif set(self.speaker_ids) == set(speaker_ids_vl):
+            self.speaker_ids_repr = 'speaker_ids_vl'
+        elif set(self.speaker_ids) == set(speaker_ids_te):
+            self.speaker_ids_repr = 'speaker_ids_te'
+        elif set(self.speaker_ids) == set(speaker_ids_all):
+            self.speaker_ids_repr = 'speaker_ids_all'
 
         # missing pairs of arguments
         if not split_premixture:
@@ -627,9 +644,9 @@ class Mixtures:
                 raise ValueError('Expected `split_premixture` to be either '
                                  '"train", "val", or "test".')
         if snr_mixture is not None:
-            if not (split_mixture in ('train', 'test')):
+            if not (split_mixture in ('train', 'val', 'test')):
                 raise ValueError('Expected `split_mixture` to be either '
-                                 '"train" or "test".')
+                                 '"train", "val", or "test".')
         self.split_speech = split_speech
         self.split_premixture = split_premixture or ''
         self.split_mixture = split_mixture or ''
@@ -676,19 +693,9 @@ class Mixtures:
         self.add_noise = bool(
             (snr_mixture is not None) and (self.len_n > 0))
 
-        # if dealing with a single-speaker, load all the audio data in advance
-        self.speech_data = np.empty(0)
-        if self.is_personalized:
-            self.speech_data = wav_read_multiple(
-                self.corpus_s.filepath, concatenate=True)
-            # truncate the single-speaker data if specified
-            if self.dataset_duration:
-                max_length = int(sample_rate * self.dataset_duration)
-                self.speech_data = self.speech_data[:max_length]
-        else:
-            if self.add_premixture_noise:
-                raise ExperimentError('Non-personalized dataset contains '
-                                      'premixture noise.')
+        if not self.is_personalized and self.add_premixture_noise:
+            raise ExperimentError('Non-personalized dataset contains '
+                                  'premixture noise.')
 
     def __dict__(self):
         return {
@@ -697,7 +704,7 @@ class Mixtures:
                 'add_premixture_noise': self.add_premixture_noise,
                 'add_noise': self.add_noise,
             },
-            'speaker_ids': self.speaker_ids,
+            'speaker_ids': self.speaker_ids_repr or self.speaker_ids,
             'snr_premixture_min': self.snr_premixture_min,
             'snr_premixture_max': self.snr_premixture_max,
             'snr_mixture_min': self.snr_mixture_min,
@@ -764,11 +771,70 @@ speaker_ids_all = speaker_ids_tr + speaker_ids_vl + speaker_ids_te
 speaker_split_durations = df_librispeech.groupby(
     ['speaker_id', 'split']).agg('sum').duration
 
-# expose test sets
-data_te_generalist: Mixtures = Mixtures(
-    speaker_ids_te, 'test', split_mixture='test', snr_mixture=(-5, 5)
+# expose training, validation, and test datasets
+data_tr_generalist: Mixtures = Mixtures(
+    speaker_ids_tr,
+    split_speech='all',
+    split_mixture='train',
+    snr_mixture=(-5, 5)
 )
-data_te_specialist: List[Mixtures] = [
-    Mixtures(speaker_id, 'test', split_mixture='test', snr_mixture=(-5, 5))
-    for speaker_id in speaker_ids_te
-]
+data_ptr_specialist: Tuple[Mixtures] = tuple([
+    Mixtures(
+        speaker_id,
+        split_speech='pretrain',
+        split_premixture='train',
+        split_mixture='train',
+        snr_premixture=(0, 10),
+        snr_mixture=(-5, 5)
+    ) for speaker_id in speaker_ids_te
+])
+data_tr_specialist: Tuple[Mixtures] = tuple([
+    Mixtures(
+        speaker_id,
+        split_speech='train',
+        split_premixture='train',
+        split_mixture='train',
+        snr_premixture=(0, 10),
+        snr_mixture=(-5, 5)
+    ) for speaker_id in speaker_ids_te
+])
+data_vl_generalist: Mixtures = Mixtures(
+    speaker_ids_vl,
+    split_speech='all',
+    split_mixture='val',
+    snr_mixture=(-5, 5)
+)
+data_pvl_specialist: Tuple[Mixtures] = tuple([
+    Mixtures(
+        speaker_id,
+        split_speech='preval',
+        split_premixture='val',
+        split_mixture='val',
+        snr_premixture=(0, 10),
+        snr_mixture=(-5, 5)
+    ) for speaker_id in speaker_ids_te
+])
+data_vl_specialist: Tuple[Mixtures] = tuple([
+    Mixtures(
+        speaker_id,
+        split_speech='val',
+        split_premixture='val',
+        split_mixture='val',
+        snr_premixture=(0, 10),
+        snr_mixture=(-5, 5)
+    ) for speaker_id in speaker_ids_te
+])
+data_te_generalist: Mixtures = Mixtures(
+    speaker_ids_te,
+    split_speech='test',
+    split_mixture='test',
+    snr_mixture=(-5, 5)
+)
+data_te_specialist: Tuple[Mixtures] = tuple([
+    Mixtures(
+        speaker_id,
+        split_speech='test',
+        split_mixture='test',
+        snr_mixture=(-5, 5)
+    ) for speaker_id in speaker_ids_te
+])
