@@ -586,7 +586,7 @@ class Mixtures:
         if not set(speaker_id_or_ids).issubset(set(speaker_ids_all)):
             raise ValueError('Invalid speaker IDs, not found in LibriSpeech.')
         self.speaker_ids = speaker_id_or_ids
-        self.speaker_ids_repr = ''
+        self.speaker_ids_repr = repr(self.speaker_ids)
         if set(self.speaker_ids) == set(speaker_ids_tr):
             self.speaker_ids_repr = 'speaker_ids_tr'
         elif set(self.speaker_ids) == set(speaker_ids_vl):
@@ -704,7 +704,7 @@ class Mixtures:
                 'add_premixture_noise': self.add_premixture_noise,
                 'add_noise': self.add_noise,
             },
-            'speaker_ids': self.speaker_ids_repr or self.speaker_ids,
+            'speaker_ids': self.speaker_ids_repr,
             'snr_premixture_min': self.snr_premixture_min,
             'snr_premixture_max': self.snr_premixture_max,
             'snr_mixture_min': self.snr_mixture_min,
@@ -771,70 +771,11 @@ speaker_ids_all = speaker_ids_tr + speaker_ids_vl + speaker_ids_te
 speaker_split_durations = df_librispeech.groupby(
     ['speaker_id', 'split']).agg('sum').duration
 
-# expose training, validation, and test datasets
-data_tr_generalist: Mixtures = Mixtures(
-    speaker_ids_tr,
-    split_speech='all',
-    split_mixture='train',
-    snr_mixture=(-5, 5)
-)
-data_ptr_specialist: Tuple[Mixtures] = tuple([
-    Mixtures(
-        speaker_id,
-        split_speech='pretrain',
-        split_premixture='train',
-        split_mixture='train',
-        snr_premixture=(0, 10),
-        snr_mixture=(-5, 5)
-    ) for speaker_id in speaker_ids_te
-])
-data_tr_specialist: Tuple[Mixtures] = tuple([
-    Mixtures(
-        speaker_id,
-        split_speech='train',
-        split_premixture='train',
-        split_mixture='train',
-        snr_premixture=(0, 10),
-        snr_mixture=(-5, 5)
-    ) for speaker_id in speaker_ids_te
-])
-data_vl_generalist: Mixtures = Mixtures(
-    speaker_ids_vl,
-    split_speech='all',
-    split_mixture='val',
-    snr_mixture=(-5, 5)
-)
-data_pvl_specialist: Tuple[Mixtures] = tuple([
-    Mixtures(
-        speaker_id,
-        split_speech='preval',
-        split_premixture='val',
-        split_mixture='val',
-        snr_premixture=(0, 10),
-        snr_mixture=(-5, 5)
-    ) for speaker_id in speaker_ids_te
-])
-data_vl_specialist: Tuple[Mixtures] = tuple([
-    Mixtures(
-        speaker_id,
-        split_speech='val',
-        split_premixture='val',
-        split_mixture='val',
-        snr_premixture=(0, 10),
-        snr_mixture=(-5, 5)
-    ) for speaker_id in speaker_ids_te
-])
+# expose test sets
 data_te_generalist: Mixtures = Mixtures(
-    speaker_ids_te,
-    split_speech='test',
-    split_mixture='test',
-    snr_mixture=(-5, 5)
+    speaker_ids_te, 'test', split_mixture='test', snr_mixture=(-5, 5)
 )
-data_te_specialist: Tuple[Mixtures] = tuple([
-    Mixtures(
-        speaker_id,
-        split_speech='test',
-        split_mixture='test',
-        snr_mixture=(-5, 5)
-    ) for speaker_id in speaker_ids_te
-])
+data_te_specialist: List[Mixtures] = [
+    Mixtures(speaker_id, 'test', split_mixture='test', snr_mixture=(-5, 5))
+    for speaker_id in speaker_ids_te
+]
