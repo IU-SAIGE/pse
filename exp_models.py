@@ -1,7 +1,7 @@
 import json
 import os
 import pathlib
-from contextlib import nullcontext
+from contextlib import suppress
 from typing import Optional, Union, Sequence
 from typing import Tuple
 
@@ -10,8 +10,8 @@ import torch
 import torch.nn.functional as tf
 from torch.nn.modules.loss import _Loss
 
-from exp_data import Mixtures, sample_rate, sisdr_improvement, speaker_ids_te, \
-    speaker_ids_tr, speaker_ids_vl, data_te_generalist
+from exp_data import Mixtures, sample_rate, sisdr_improvement, \
+    data_te_generalist
 from exp_utils import make_2d, make_3d, pad_x_to_y, shape_reconstructed
 
 _fft_size: int = 1024
@@ -159,9 +159,9 @@ class SNRPredictor(torch.nn.Module):
 
         # generate frame-by-frame SNR predictions
         predicted_snrs = self.dnn(self.rnn(X_magnitude)[0]).reshape(
-            -1, X_magnitude.shape[1])
+            -1, X_magnitude.shape[1]).detach()
 
-        return _logistic(predicted_snrs) if self.training else predicted_snrs
+        return predicted_snrs if self.training else _logistic(predicted_snrs)
 
     def load(self):
         self.load_state_dict(torch.load('snr_predictor'), strict=False)
@@ -288,7 +288,7 @@ def feedforward(
     """Runs a feedforward pass through a model by unraveling batched data.
     """
     batch_size = inputs.shape[0]
-    context = torch.no_grad() if (validation or test) else nullcontext()
+    context = torch.no_grad() if (validation or test) else suppress()
     sisdri = 0
     loss_tensor = torch.Tensor()
 
@@ -305,12 +305,11 @@ def feedforward(
 
                 # backwards pass
                 if not test:
-                    if weights:
+                    if weights is not None:
                         w = weights[i].unsqueeze(0)
                         loss_tensor = criterion(y, t, w).mean()
                     else:
                         loss_tensor = criterion(y, t).mean()
-                    loss_tensor /= batch_size
                 if not (validation or test):
                     loss_tensor.backward()
 
@@ -328,7 +327,7 @@ def feedforward(
 
             # compute loss
             if not test:
-                if weights:
+                if weights is not None:
                     loss_tensor = criterion(estimates, targets, weights).mean()
                 else:
                     loss_tensor = criterion(estimates, targets).mean()
@@ -403,9 +402,9 @@ def init_model(
             model, model_config = init_ctn(**model_config)
         else:
             model, model_config = init_ctn(**{
-                'small': dict(N=64, H=64, X=2, R=2), # dict(X=1, R=1),
-                'medium': dict(N=128, H=128, X=4, R=2), # dict(X=2, R=1),
-                'large': dict(N=256, H=256, X=4, R=3),
+                'small': dict(H=64, B=16, X=7, R=2),
+                'medium': dict(H=128, B=32, X=7, R=2),
+                'large': dict(H=256, B=64, X=7, R=2),
             }.get(model_size))
     elif model_name == 'dprnntasnet':
         if model_config:
@@ -446,20 +445,17 @@ def test_denoiser_from_module(
     """
     if not isinstance(data_te, (list, tuple)):
         data_te = [data_te]
-    key_tr = repr(speaker_ids_tr)
-    key_vl = repr(speaker_ids_vl)
-    key_te = repr(speaker_ids_te)
     results = {}
     for dataset in data_te:
         batch = dataset(100, seed=0)
         noop_loss = torch.nn.Identity()
-        key = repr(dataset.speaker_ids)
-        if key == key_tr: key = 'speaker_ids_tr'
-        elif key == key_vl: key = 'speaker_ids_vl'
-        elif key == key_te: key = 'speaker_ids_te'
+        key = dataset.speaker_ids_repr
         value = feedforward(batch.inputs, batch.targets,
                             model, noop_loss, None, accumulation, test=True)[1]
         results[key] = value
+    num_tests = len(list(results.keys()))
+    if num_tests > 1:
+        results['mean']: float = sum(list(results.values())) / num_tests
     return results
 
 
@@ -507,6 +503,7 @@ def test_denoiser_from_folder(
     checkpoint_path = checkpoint_folder.joinpath(f'ckpt_{best_step:08}.pt')
     if not checkpoint_path.exists():
         raise IOError(f'{str(checkpoint_path)} does not exist.')
+    print(f'Using {checkpoint_path}...')
 
     return test_denoiser_from_file(checkpoint_path, data_te, accumulation)
 
