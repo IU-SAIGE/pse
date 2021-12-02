@@ -12,6 +12,7 @@ import torch
 from asteroid.losses.sdr import singlesrc_neg_sisdr
 from asteroid.losses.sdr import singlesrc_neg_snr
 from numpy.random import Generator
+from scipy.signal import convolve
 
 from exp_utils import ExperimentError
 
@@ -23,6 +24,7 @@ _root_librispeech: str = '/data/asivara/librispeech/'
 _root_demand: str = '/data/asivara/demand_1ch/'
 _root_fsd50k: str = '/data/asivara/fsd50k_16khz/'
 _root_musan: str = '/data/asivara/musan/'
+_root_irsurvey: str = '/data/asivara/ir_survey_16khz/'
 
 _eps: float = 1e-8
 _rng = np.random.default_rng(0)
@@ -101,28 +103,31 @@ def wav_read(
 def wav_read_multiple(
         filepaths: Sequence[Union[str, os.PathLike]],
         concatenate: bool = False,
+        randomly_offset: bool = True,
         seed: Optional[int] = None
 ) -> np.ndarray:
     """Loads multiple audio signals from file; may be batched or concatenated.
     """
     rng = np.random.default_rng(seed)
     signals = []
-    min_length = int(example_duration * sample_rate)
     collate_fn: Callable = np.concatenate if concatenate else np.stack
     for filepath in filepaths:
         s, duration = wav_read(filepath)
         if not concatenate:
-            if duration < example_duration:
-                raise ValueError(f'Expected {filepath} to have minimum duration'
-                                 f'of {example_duration} seconds.')
-            offset = 0
-            try:
-                if len(s) > min_length:
-                    offset = rng.integers(0, len(s) - min_length)
-            except ValueError as e:
-                print(filepath, len(s), min_length)
-                raise e
-            s = s[offset:offset + min_length]
+            # pad shorter signals up to expected length
+            if len(s) < example_length:
+                lengths = [(0, 0)] * s.ndim
+                lengths[-1] = (0, example_length - len(s))
+                s = np.pad(s, lengths, mode='constant')
+
+            # randomly offset longer signals if desired
+            offset: int = 0
+            remainder: int = len(s) - example_length
+            if randomly_offset and remainder > 0:
+                offset = rng.integers(0, remainder)
+
+            # trim exactly to the expected length
+            s = s[offset:offset + example_length]
         signals.append(s)
     return collate_fn(signals, axis=0)
 
@@ -530,6 +535,54 @@ def dataframe_musan(
     return df
 
 
+def dataframe_irsurvey(
+        dataset_directory: Union[str, os.PathLike] = _root_irsurvey
+) -> pd.DataFrame:
+    """Creates a Pandas DataFrame with files from the MIT Acoustical
+    Reverberation Scene Statistics Survey. Root directory should mimic
+    archive-extracted folder structure. Dataset may be downloaded at
+    `<https://mcdermottlab.mit.edu/Reverb/IR_Survey.html>`_.
+    """
+    rows = []
+    files = sorted(pathlib.Path(dataset_directory).glob('*.wav'))
+    if not len(files) == 270:
+        raise ValueError(f'Audio files missing, check {dataset_directory}.')
+
+    for filepath in files:
+        ir_name = ''.join(filepath.name.split('_')[1:-1])
+        ir_duration = wav_read(filepath)[1]
+        if filepath.name == 'h053_Office_ConferenceRoom_stxts.wav':
+            ir_frequency = 3
+        else:
+            try:
+                ir_frequency = int(
+                    filepath.name.split('txt')[0].split('_')[-1])
+            except (Exception,):
+                ir_frequency = 1
+        rows += [(ir_name, ir_frequency, ir_duration, str(filepath))]
+
+    df = pd.DataFrame(
+        rows, columns=['name', 'frequency', 'duration', 'filepath'])
+
+    # shuffle the recordings
+    df = df.sample(frac=1, random_state=200)
+
+    # organize by split
+    df['split'] = 'train'
+    df.loc[int(270 * .8):int(270 * .9), 'split'] = 'val'
+    df.loc[int(270 * .9):, 'split'] = 'test'
+
+    # ensure that all the audio files exist
+    if not all(df.filepath.apply(os.path.isfile)):
+        raise ValueError(f'Audio files missing, check {dataset_directory}.')
+
+    # reindex and name the dataframe
+    df = df[['filepath', 'split', 'duration', 'frequency']]
+    df = df.reset_index(drop=True)
+    df.index.name = 'IR_SURVEY'
+    return df
+
+
 def split_speakers(
         only_tc100: bool = True
 ) -> Tuple[List, List, List]:
@@ -570,11 +623,12 @@ class Mixtures:
             split_speech: Optional[str] = 'all',
             split_premixture: Optional[str] = 'train',
             split_mixture: Optional[str] = 'train',
+            split_reverb: Optional[str] = None,
             corpus_premixture: str = 'fsd50k',
             corpus_mixture: str = 'musan',
             snr_premixture: Optional[Union[float, Tuple[float, float]]] = None,
             snr_mixture: Optional[Union[float, Tuple[float, float]]] = None,
-            dataset_duration: Optional[float] = None,
+            dataset_duration: Optional[float] = None
     ):
         # verify speaker ID(s)
         if isinstance(speaker_id_or_ids, int):
@@ -647,9 +701,14 @@ class Mixtures:
             if not (split_mixture in ('train', 'val', 'test')):
                 raise ValueError('Expected `split_mixture` to be either '
                                  '"train", "val", or "test".')
+        if split_reverb is not None:
+            if not (split_reverb in ('train', 'val', 'test')):
+                raise ValueError('Expected `split_reverb` to be either '
+                                 '"train", "val", or "test".')
         self.split_speech = split_speech
         self.split_premixture = split_premixture or ''
         self.split_mixture = split_mixture or ''
+        self.split_reverb = split_reverb or ''
 
         # verify dataset duration
         if not isinstance(dataset_duration, (int, float, type(None))):
@@ -669,6 +728,8 @@ class Mixtures:
             f'split == "{self.split_premixture}"')
         self.corpus_n = get_noise_corpus(corpus_mixture).query(
             f'split == "{self.split_mixture}"')
+        self.corpus_r = df_irsurvey.query(
+            f'split == "{self.split_reverb}"')
 
         # calculate maximum random offset for all utterances
         max_offset_func = lambda d: d.assign(max_offset=(
@@ -683,6 +744,7 @@ class Mixtures:
         self.len_s = len(self.corpus_s)
         self.len_m = len(self.corpus_m)
         self.len_n = len(self.corpus_n)
+        self.len_r = len(self.corpus_r)
         if self.len_s < 1:
             raise ValueError('Invalid speaker_id')
 
@@ -692,6 +754,7 @@ class Mixtures:
             (snr_premixture is not None) and (self.len_m > 0))
         self.add_noise = bool(
             (snr_mixture is not None) and (self.len_n > 0))
+        self.add_reverb = bool(self.len_r > 0)
 
         if not self.is_personalized and self.add_premixture_noise:
             raise ExperimentError('Non-personalized dataset contains '
@@ -729,9 +792,18 @@ class Mixtures:
 
         indices = np.arange(batch_size * tmp_index,
                             batch_size * (tmp_index + 1))
-        s_filepaths = self.corpus_s.filepath.iloc[indices % self.len_s]
-        m_filepaths = self.corpus_m.filepath.iloc[indices % self.len_m]
-        n_filepaths = self.corpus_n.filepath.iloc[indices % self.len_n]
+        s_filepaths = []
+        if self.len_s:
+            s_filepaths = self.corpus_s.filepath.iloc[indices % self.len_s]
+        m_filepaths = []
+        if self.len_m:
+            m_filepaths = self.corpus_m.filepath.iloc[indices % self.len_m]
+        n_filepaths = []
+        if self.len_n:
+            n_filepaths = self.corpus_n.filepath.iloc[indices % self.len_n]
+        r_filepaths = []
+        if self.len_r:
+            r_filepaths = self.corpus_r.filepath.iloc[indices % self.len_r]
 
         s = wav_read_multiple(s_filepaths, seed=seed)
         x = p = s
@@ -743,6 +815,14 @@ class Mixtures:
                 self.snr_premixture_min, self.snr_premixture_max,
                 (batch_size, 1))
             x = p = mix_signals(s, m, pre_snrs)
+
+        if self.add_reverb:
+            r = wav_read_multiple(r_filepaths, randomly_offset=False, seed=seed)
+            p_rev = np.empty_like(p)
+            p_len = p.shape[-1]
+            for i, filt in enumerate(r):
+                p_rev[i] = convolve(p[i], filt, mode='full')[:p_len]
+            p = p_rev
 
         post_snrs = np.array(np.nan * np.ones(batch_size))
         if self.add_noise:
@@ -766,6 +846,7 @@ df_librispeech = dataframe_librispeech()
 df_musan = dataframe_musan()
 df_fsd50k = dataframe_fsd50k()
 df_demand = dataframe_demand()
+df_irsurvey = dataframe_irsurvey()
 speaker_ids_tr, speaker_ids_vl, speaker_ids_te = split_speakers(False)
 speaker_ids_all = speaker_ids_tr + speaker_ids_vl + speaker_ids_te
 speaker_split_durations = df_librispeech.groupby(
