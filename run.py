@@ -177,20 +177,23 @@ def train_denoiser(
                     raise EarlyStopping()
 
     except EarlyStopping:
+        step_path = output_directory.joinpath(f'early_stopping.txt')
+        with open(step_path, 'w') as fp:
+            print('{},{}'.format(num_examples, min_loss_num_examples), file=fp)
         print(f'Automatically exited after {num_examples_earlystopping} '
               f'examples; best model saw {min_loss_num_examples} examples.')
 
     except KeyboardInterrupt:
         print(f'Manually exited at {num_examples} examples; best model saw '
               f'{min_loss_num_examples} examples.')
-        torch.save({
-            'num_examples': num_examples,
-            'model_name': model_name,
-            'model_config': model_config,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict()
-        }, output_directory.joinpath(f'ckpt_last.pt'))
-        sys.exit(-1)
+
+    torch.save({
+        'num_examples': num_examples,
+        'model_name': model_name,
+        'model_config': model_config,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict()
+    }, output_directory.joinpath(f'ckpt_last.pt'))
 
     # close the summary
     writer.close()
