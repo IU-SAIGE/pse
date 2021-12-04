@@ -3,7 +3,6 @@ import itertools
 import json
 import os
 import pathlib
-import sys
 import warnings
 from datetime import datetime
 from math import ceil
@@ -15,10 +14,11 @@ import torch
 import yaml
 from torch.utils.tensorboard import SummaryWriter
 
-from exp_data import Mixtures, sample_rate, example_duration
+from exp_data import ContrastiveMixtures, Mixtures
+from exp_data import example_duration, sample_rate
 from exp_data import speaker_ids_tr, speaker_ids_vl, speaker_ids_te
-from exp_models import init_model, feedforward, SegmentalLoss, SNRPredictor
-from exp_models import test_denoiser_from_folder
+from exp_models import init_model, contrastive_feedforward, feedforward
+from exp_models import SNRPredictor, test_denoiser_from_folder
 from exp_utils import EarlyStopping, ExperimentError
 
 warnings.filterwarnings('ignore')
@@ -52,14 +52,16 @@ def train_denoiser(
     model, nparams, model_config = init_model(model_name, model_size)
     model = model.cuda()
     optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
-    criterion = torch.nn.MSELoss(reduction='mean')
     predictor = torch.nn.Identity()
     if use_loss_purification:
-        criterion = SegmentalLoss('mse', reduction='mean')
         predictor = SNRPredictor()
         predictor.load_state_dict(torch.load('snr_predictor'), strict=False)
         predictor.cuda()
         predictor.eval()
+
+    use_loss_contrastive: bool = bool(isinstance(data_tr, ContrastiveMixtures))
+    if not type(data_tr) is type(data_vl):
+        raise ValueError('`data_tr` and `data_vl` should be the same type.')
 
     # load a previous checkpoint if provided
     init_num_examples = 0
@@ -85,6 +87,7 @@ def train_denoiser(
         'num_examples_validation': num_examples_validation,
         'sample_rate': sample_rate,
         'speaker_ids': data_tr.speaker_ids_repr,
+        'use_loss_contrastive': use_loss_contrastive,
         'use_loss_purification': use_loss_purification,
     }
 
@@ -107,7 +110,31 @@ def train_denoiser(
         for num_examples in itertools.count(start=init_num_examples,
                                             step=batch_size):
             model.train()
-            with torch.set_grad_enabled(True):
+            if use_loss_contrastive:
+
+                # pick up a training batch
+                batch = data_tr(batch_size)
+                x_1 = batch.inputs_1.cuda()
+                x_2 = batch.inputs_2.cuda()
+                p_1 = batch.targets_1.cuda()
+                p_2 = batch.targets_2.cuda()
+
+                # estimate data purification weights
+                w_1 = predictor(p_1) if use_loss_purification else None
+                w_2 = predictor(p_2) if use_loss_purification else None
+
+                # forward propagation
+                loss_tr, sisdri_tr = contrastive_feedforward(
+                    inputs_1=x_1, inputs_2=x_2,
+                    targets_1=p_1, targets_2=p_2,
+                    weights_1=w_1, weights_2=w_2,
+                    lambda_positive=1., lambda_negative=1.,
+                    labels=batch.labels.cuda(),
+                    model=model.cuda(),
+                    accumulation=use_gradient_accumulation,
+                    validation=False)
+
+            else:
 
                 # pick up a training batch
                 batch = data_tr(batch_size)
@@ -119,12 +146,12 @@ def train_denoiser(
 
                 # forward propagation
                 loss_tr, sisdri_tr = feedforward(
-                    x, p, model, criterion, w, use_gradient_accumulation,
+                    x, p, model, w, use_gradient_accumulation,
                     validation=False)
 
-                # update parameters
-                optimizer.step()
-                optimizer.zero_grad()
+            # update parameters
+            optimizer.step()
+            optimizer.zero_grad()
 
             if num_examples > (num_validations * num_examples_validation):
                 continue
@@ -133,17 +160,44 @@ def train_denoiser(
             model.eval()
             with torch.no_grad():
 
-                # pick up a validation batch
-                batch = data_vl(batch_size, seed=0)
-                x = batch.inputs.cuda()
-                p = batch.targets.cuda()
+                if use_loss_contrastive:
 
-                # estimate data purification weights
-                w = predictor(p) if use_loss_purification else None
+                    # pick up a validation batch
+                    batch = data_vl(batch_size, seed=0)
+                    x_1 = batch.inputs_1.cuda()
+                    x_2 = batch.inputs_2.cuda()
+                    p_1 = batch.targets_1.cuda()
+                    p_2 = batch.targets_2.cuda()
 
-                loss_vl, sisdri_vl = feedforward(
-                    x, p, model, criterion, w, use_gradient_accumulation,
-                    validation=True)
+                    # estimate data purification weights
+                    w_1 = predictor(p_1) if use_loss_purification else None
+                    w_2 = predictor(p_2) if use_loss_purification else None
+
+                    # forward propagation
+                    loss_vl, sisdri_vl = contrastive_feedforward(
+                        inputs_1=x_1, inputs_2=x_2,
+                        targets_1=p_1, targets_2=p_2,
+                        weights_1=w_1, weights_2=w_2,
+                        lambda_positive=1., lambda_negative=1.,
+                        labels=batch.labels.cuda(),
+                        model=model.cuda(),
+                        accumulation=use_gradient_accumulation,
+                        validation=True)
+
+                else:
+
+                    # pick up a validation batch
+                    batch = data_vl(batch_size, seed=0)
+                    x = batch.inputs.cuda()
+                    p = batch.targets.cuda()
+
+                    # estimate data purification weights
+                    w = predictor(p) if use_loss_purification else None
+
+                    # forward propagation
+                    loss_vl, sisdri_vl = feedforward(
+                        x, p, model, w, use_gradient_accumulation,
+                        validation=True)
 
                 # write summaries
                 writer.add_scalar('MSELoss/train',
@@ -214,12 +268,17 @@ def parse_arguments():
     parser.add_argument('-b', '--batch_size', type=int, default=64)
     parser.add_argument('-l', '--learning_rate', type=float, default=1e-3)
     parser.add_argument('--use_loss_purification', action='store_true')
+    parser.add_argument('--use_loss_contrastive', action='store_true')
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
     print(args)
+
+    dataset_class = Mixtures
+    if args.use_loss_contrastive:
+        dataset_class = ContrastiveMixtures
 
     # train one or more specialist models
     if args.speaker_id:
@@ -232,10 +291,10 @@ def main():
 
         for speaker_id in args.speaker_id:
 
-            d_tr = Mixtures(speaker_id, split_speech='pretrain',
+            d_tr = dataset_class(speaker_id, split_speech='pretrain',
                             split_premixture='train', split_mixture='train',
                             snr_premixture=(0, 10), snr_mixture=(-5, 5))
-            d_vl = Mixtures(speaker_id, split_speech='preval',
+            d_vl = dataset_class(speaker_id, split_speech='preval',
                             split_premixture='val', split_mixture='val',
                             snr_premixture=(0, 10), snr_mixture=(-5, 5))
 
@@ -247,8 +306,9 @@ def main():
                 learning_rate=args.learning_rate,
                 batch_size=args.batch_size,
                 use_loss_purification=args.use_loss_purification,
-                trial_name='{}_{}_sp{:03}{}'.format(
+                trial_name='{}_{}_sp{:03}{}{}'.format(
                     args.model_name, args.model_size, speaker_id,
+                    '_cm' if args.use_loss_contrastive else '',
                     '_dp' if args.use_loss_purification else ''
                 )
             )
@@ -257,12 +317,12 @@ def main():
     # train one generalist model
     else:
 
-        d_tr = Mixtures(speaker_ids_tr,
-                        split_mixture='train',
-                        snr_mixture=(-5, 5))
-        d_vl = Mixtures(speaker_ids_vl,
-                        split_mixture='val',
-                        snr_mixture=(-5, 5))
+        d_tr = dataset_class(speaker_ids_tr,
+                             split_mixture='train',
+                             snr_mixture=(-5, 5))
+        d_vl = dataset_class(speaker_ids_vl,
+                             split_mixture='val',
+                             snr_mixture=(-5, 5))
 
         results_directory = train_denoiser(
             model_name=args.model_name,

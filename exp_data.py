@@ -29,7 +29,11 @@ _root_irsurvey: str = '/data/asivara/ir_survey_16khz/'
 _eps: float = 1e-8
 _rng = np.random.default_rng(0)
 
-Batch = namedtuple('Batch', 'inputs targets pre_snrs post_snrs')
+Batch = namedtuple(
+    'Batch', ('inputs','targets','pre_snrs','post_snrs'))
+ContrastiveBatch = namedtuple(
+    'ContrastiveBatch', ('inputs_1','targets_1','inputs_2','targets_2',
+                         'labels','pre_snrs','post_snrs'))
 
 def _make_2d(x: torch.Tensor):
     """Normalize shape of `x` to two dimensions: [batch, time]."""
@@ -792,18 +796,14 @@ class Mixtures:
 
         indices = np.arange(batch_size * tmp_index,
                             batch_size * (tmp_index + 1))
-        s_filepaths = []
-        if self.len_s:
-            s_filepaths = self.corpus_s.filepath.iloc[indices % self.len_s]
-        m_filepaths = []
-        if self.len_m:
-            m_filepaths = self.corpus_m.filepath.iloc[indices % self.len_m]
-        n_filepaths = []
-        if self.len_n:
-            n_filepaths = self.corpus_n.filepath.iloc[indices % self.len_n]
-        r_filepaths = []
-        if self.len_r:
-            r_filepaths = self.corpus_r.filepath.iloc[indices % self.len_r]
+        s_filepaths = (list(self.corpus_s.filepath.iloc[indices % self.len_s])
+                       if self.len_s else [])
+        m_filepaths = (list(self.corpus_m.filepath.iloc[indices % self.len_m])
+                       if self.len_m else [])
+        n_filepaths = (list(self.corpus_n.filepath.iloc[indices % self.len_n])
+                       if self.len_n else [])
+        r_filepaths = (list(self.corpus_r.filepath.iloc[indices % self.len_r])
+                       if self.len_r else [])
 
         s = wav_read_multiple(s_filepaths, seed=seed)
         x = p = s
@@ -822,7 +822,7 @@ class Mixtures:
             p_len = p.shape[-1]
             for i, filt in enumerate(r):
                 p_rev[i] = convolve(p[i], filt, mode='full')[:p_len]
-            p = p_rev
+            x = p = p_rev
 
         post_snrs = np.array(np.nan * np.ones(batch_size))
         if self.add_noise:
@@ -838,6 +838,125 @@ class Mixtures:
             targets=torch.FloatTensor(p) / scale_factor,  # premixture signal
             pre_snrs=torch.FloatTensor(pre_snrs),
             post_snrs=torch.FloatTensor(post_snrs)
+        )
+
+
+class ContrastiveMixtures(Mixtures):
+
+    def __call__(
+            self,
+            batch_size: int,
+            ratio_positive: float = 0.5,
+            seed: Optional[int] = None
+    ):
+        if not (0 <= ratio_positive <= 1):
+            raise ValueError('ratio_positive should be between 0 and 1.')
+        if batch_size < 2:
+            raise ValueError('batch_size must be at least 2.')
+        if batch_size % 2:
+            raise ValueError('batch_size must be an even number.')
+
+        if seed is None: self.index += 1
+        tmp_index: int = 0 if seed is not None else self.index
+        tmp_rng: Generator = np.random.default_rng(tmp_index)
+
+        indices = np.arange(batch_size * tmp_index,
+                            batch_size * (tmp_index + 1))
+        s_filepaths = (list(self.corpus_s.filepath.iloc[indices % self.len_s])
+                       if self.len_s else [])
+        m_filepaths = (list(self.corpus_m.filepath.iloc[indices % self.len_m])
+                       if self.len_m else [])
+        n_filepaths = (list(self.corpus_n.filepath.iloc[indices % self.len_n])
+                       if self.len_n else [])
+        r_filepaths = (list(self.corpus_r.filepath.iloc[indices % self.len_r])
+                       if self.len_r else [])
+
+        ordering = tmp_rng.permutation(batch_size//2)
+        num_positive = int(batch_size//2 * ratio_positive)
+        num_negative = batch_size//2 - num_positive
+        labels = np.array([1]*num_positive + [0]*num_negative)
+
+        bx_1, bx_2, bp_1, bp_2, bs_1, bs_2 = [], [], [], [], [], []
+        bpre_snrs, bpost_snrs = [], []
+
+        # generate pairs
+        for i in range(0, batch_size, 2):
+
+            is_positive = bool(i/2 < num_positive)
+
+            if is_positive:
+                s_1 = s_2 = wav_read_multiple([s_filepaths[i]], seed=seed)
+            else:
+                s_1, s_2 = wav_read_multiple(s_filepaths[i:i+2], seed=seed)
+            s_1, s_2 = s_1.reshape(-1), s_2.reshape(-1)
+
+            p_1, p_2 = s_1, s_2
+            pre_snr = [None, None]
+            if self.add_premixture_noise:
+                if is_positive:
+                    m_1 = m_2 = wav_read_multiple([m_filepaths[i]], seed=seed)
+                    pre_snr = [tmp_rng.uniform(
+                        self.snr_premixture_min, self.snr_premixture_max)] * 2
+                else:
+                    m_1, m_2 = wav_read_multiple(m_filepaths[i:i+2], seed=seed)
+                    pre_snr = tmp_rng.uniform(
+                        self.snr_premixture_min, self.snr_premixture_max, 2)
+                m_1, m_2 = m_1.reshape(-1), m_2.reshape(-1)
+                p_1 = mix_signals(s_1, m_1, pre_snr[0])
+                p_2 = mix_signals(s_2, m_2, pre_snr[1])
+
+            if self.add_reverb:
+                if is_positive:
+                    r_1 = r_2 = wav_read_multiple([r_filepaths[i]], seed=seed)
+                else:
+                    r_1, r_2 = wav_read_multiple(r_filepaths[i:i+2], seed=seed)
+                r_1, r_2 = r_1.reshape(-1), r_2.reshape(-1)
+                p_len = p_1.shape[-1]
+                p_1 = convolve(p_1, r_1, mode='full')[:p_len]
+                p_2 = convolve(p_2, r_2, mode='full')[:p_len]
+
+            x_1, x_2 = p_1, p_2
+            post_snr = [None, None]
+            if self.add_noise:
+                if not is_positive:
+                    n_1 = n_2 = wav_read_multiple([n_filepaths[i]], seed=seed)
+                    post_snr = [tmp_rng.uniform(
+                        self.snr_mixture_min, self.snr_mixture_max)] * 2
+                else:
+                    n_1, n_2 = wav_read_multiple(n_filepaths[i:i+2], seed=seed)
+                    post_snr = tmp_rng.uniform(
+                        self.snr_mixture_min, self.snr_mixture_max, 2)
+                n_1, n_2 = n_1.reshape(-1), n_2.reshape(-1)
+                x_1 = mix_signals(p_1, n_1, post_snr[0])
+                x_2 = mix_signals(p_2, n_2, post_snr[1])
+
+            bp_1.append(p_1)
+            bp_2.append(p_2)
+            bx_1.append(x_1)
+            bx_2.append(x_2)
+            bpre_snrs.append(pre_snr)
+            bpost_snrs.append(post_snr)
+
+        # stack and shuffle all the data in the right order
+        bp_1 = np.stack(bp_1)[ordering]
+        bp_2 = np.stack(bp_2)[ordering]
+        bx_1 = np.stack(bx_1)[ordering]
+        bx_2 = np.stack(bx_2)[ordering]
+        bpre_snrs = np.stack(bpre_snrs)[ordering]
+        bpost_snrs = np.stack(bpost_snrs)[ordering]
+        labels = labels[ordering]
+
+        scale_factor_1 = float(np.abs(bx_1).max() + _eps)
+        scale_factor_2 = float(np.abs(bx_2).max() + _eps)
+        scale_factor = max([scale_factor_1, scale_factor_2])
+        return ContrastiveBatch(
+            inputs_1=torch.FloatTensor(bx_1) / scale_factor,
+            inputs_2=torch.FloatTensor(bx_2) / scale_factor,
+            targets_1=torch.FloatTensor(bp_1) / scale_factor,
+            targets_2=torch.FloatTensor(bp_2) / scale_factor,
+            labels=torch.BoolTensor(labels),
+            pre_snrs=torch.FloatTensor(bpre_snrs),
+            post_snrs=torch.FloatTensor(bpost_snrs)
         )
 
 
