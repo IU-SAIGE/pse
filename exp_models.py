@@ -14,11 +14,13 @@ from exp_data import Mixtures, sample_rate, sisdr_improvement, \
     data_te_generalist
 from exp_utils import make_2d, make_3d, pad_x_to_y, shape_reconstructed
 
+
 _fft_size: int = 1024
 _hop_size: int = 256
 _eps: float = 1e-8
 _recover_noise: bool = False
 _window: torch.Tensor = torch.hann_window(_fft_size)
+
 
 def _forward_single_mask(self, waveform: torch.Tensor):
     """Custom forward function to do single-mask two-source estimation.
@@ -367,11 +369,10 @@ def contrastive_feedforward(
     labels = labels.bool()
     batch_size = inputs_1.shape[0]
     context = torch.no_grad() if (validation or test) else suppress()
-    sisdri = 0
-    loss_tensor = torch.Tensor(0)
-    reduction = torch.mean
-    ratio_positive = float(sum(labels) / batch_size)
-    ratio_negative = float(sum(~labels) / batch_size)
+    sisdri, loss_value = 0, 0
+    ratio_pos = float(sum(labels) / batch_size)
+    ratio_neg = float(sum(~labels) / batch_size)
+    use_dp = bool(weights_1 is not None) and bool(weights_2 is not None)
 
     with context:
         if accumulation:
@@ -382,85 +383,104 @@ def contrastive_feedforward(
                 x_2 = inputs_2[i].unsqueeze(0).cuda()
                 t_1 = targets_1[i].unsqueeze(0).cuda()
                 t_2 = targets_2[i].unsqueeze(0).cuda()
-                l = labels[i]
 
                 # forward pass
                 y_1 = make_2d(model(x_1))
                 y_2 = make_2d(model(x_2))
 
+                # stack for batchwise loss
                 x = torch.cat([x_1, x_2], dim=0)
                 t = torch.cat([t_1, t_2], dim=0)
                 y = torch.cat([y_1, y_2], dim=0)
 
-                # backwards pass
+                # calculate loss
                 if not test:
-                    if weights_1 is not None:
+                    if use_dp:
                         w_1 = weights_1[i].unsqueeze(0).cuda()
                         w_2 = weights_2[i].unsqueeze(0).cuda()
+                        w_p = w_1 * w_2
                         w = torch.cat([w_1, w_2], dim=0)
-                        loss_tensor = reduction(loss_wmse(y, t, w))
+                        loss_tensor = torch.mean(loss_wmse(y, t, w))
+                        if labels[i]:
+                            loss_tensor += lambda_positive * torch.mean(
+                                loss_wmse(y_1, y_2, w_1))
+                        else:
+                            loss_tensor += lambda_negative * torch.mean(
+                                torch.pow(loss_wmse(y_1, y_2, w_p) -
+                                          loss_wmse(t_1, t_2, w_p), 2))
                     else:
-                        loss_tensor = reduction(loss_mse(y, t))
-                    if l:
-                        loss_tensor += reduction(lambda_positive *
-                            loss_mse(y_1, y_2))
-                    else:
-                        loss_tensor += reduction(lambda_negative *
-                            torch.pow(loss_mse(t_1, t_2)-loss_mse(y_1, y_2), 2))
+                        loss_tensor = torch.mean(loss_mse(y, t))
+                        if labels[i]:
+                            loss_tensor += lambda_positive * torch.mean(
+                                loss_mse(y_1, y_2))
+                        else:
+                            loss_tensor += lambda_negative * torch.mean(
+                                torch.pow(loss_mse(y_1, y_2) -
+                                          loss_mse(t_1, t_2), 2))
+                    loss_value += float(loss_tensor)
 
-                # backwards pass
-                if not (validation or test):
-                    loss_tensor.backward()
+                    # backwards pass
+                    if not validation:
+                        loss_tensor.backward()
 
                 # calculate signal improvement
-                sisdri += float(torch.mean(
-                    sisdr_improvement(y, t, x)))
+                sisdri += float(sisdr_improvement(y, t, x, 'mean'))
 
             sisdri /= batch_size
+            loss_value /= batch_size
 
         else:
 
-            # forward pass
+            # unravel batch
             x_1 = inputs_1.cuda()
             x_2 = inputs_2.cuda()
             t_1 = targets_1.cuda()
             t_2 = targets_2.cuda()
+
+            # forward pass
             y_1 = make_2d(model(x_1))
             y_2 = make_2d(model(x_2))
 
-            # compute loss
+            # stack for batchwise loss
             x = torch.cat([x_1, x_2], dim=0)
             t = torch.cat([t_1, t_2], dim=0)
             y = torch.cat([y_1, y_2], dim=0)
             l = labels
 
+            # calculate loss
             if not test:
-                if weights_1 is not None:
+                if use_dp:
                     w_1 = weights_1.cuda()
                     w_2 = weights_2.cuda()
+                    w_p = w_1 * w_2
                     w = torch.cat([w_1, w_2], dim=0)
-                    loss_tensor = reduction(loss_wmse(y, t, w))
+                    loss_tensor = torch.mean(loss_wmse(y, t, w))
+                    if ratio_pos:
+                        loss_tensor += lambda_positive * ratio_pos * torch.mean(
+                            loss_wmse(y_1[l], y_2[l], w_1[l]))
+                    if ratio_neg:
+                        loss_tensor += lambda_negative * ratio_neg * torch.mean(
+                            torch.pow(loss_wmse(t_1[~l], t_2[~l], w_p[~l]) -
+                                      loss_wmse(y_1[~l], y_2[~l], w_p[~l]), 2))
                 else:
-                    loss_tensor = reduction(loss_mse(y, t))
-                if ratio_positive:
-                    loss_tensor += reduction(
-                        ratio_positive * lambda_positive *
-                        loss_mse(y_1[l], y_2[l]))
-                if ratio_negative:
-                    loss_tensor += reduction(
-                        ratio_negative * lambda_negative *
-                        torch.pow(loss_mse(t_1[~l], t_2[~l]) -
-                                  loss_mse(y_1[~l], y_2[~l]), 2))
+                    loss_tensor = torch.mean(loss_mse(y, t))
+                    if ratio_pos:
+                        loss_tensor += lambda_positive * ratio_pos * torch.mean(
+                            loss_mse(y_1[l], y_2[l]))
+                    if ratio_neg:
+                        loss_tensor += lambda_negative * ratio_neg * torch.mean(
+                            torch.pow(loss_mse(t_1[~l], t_2[~l]) -
+                                      loss_mse(y_1[~l], y_2[~l]), 2))
+                loss_value += float(loss_tensor)
 
-            # backwards pass
-            if not (validation or test):
-                loss_tensor.backward()
+                # backwards pass
+                if not validation:
+                    loss_tensor.backward()
 
             # calculate signal improvement
-            sisdri = float(torch.mean(
-                sisdr_improvement(y, t, x)))
+            sisdri += float(sisdr_improvement(y, t, x, 'mean'))
 
-    return float(loss_tensor), sisdri
+    return loss_value, sisdri
 
 
 def init_ctn(N=512, L=16, B=128, H=512, Sc=128, P=3, X=8, R=3, causal=False):
