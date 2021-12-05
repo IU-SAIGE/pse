@@ -142,7 +142,7 @@ def sisdr(
         reduction: Optional[str] = None
 ) -> torch.Tensor:
     """Calculate single source SI-SDR."""
-    return sdr(estimate, target, scale_invariant=True, reduction=reduction)
+    return sdr(estimate, target, reduction=reduction, scale_invariant=True)
 
 
 def sisdr_improvement(
@@ -154,7 +154,7 @@ def sisdr_improvement(
     """Calculate estimate to target SI-SDR improvement relative to mixture.
     """
     return sdr_improvement(
-        estimate, target, mixture, scale_invariant=True, reduction=reduction)
+        estimate, target, mixture, reduction=reduction, scale_invariant=True)
 
 
 def sdr(
@@ -180,8 +180,8 @@ def sdr_improvement(
         estimate: torch.Tensor,
         target: torch.Tensor,
         mixture: torch.Tensor,
-        scale_invariant: bool = False,
-        reduction: Optional[str] = None
+        reduction: Optional[str] = None,
+        scale_invariant: bool = False
 ) -> torch.Tensor:
     """Calculate estimate to target SDR improvement relative to mixture.
     """
