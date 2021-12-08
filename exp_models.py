@@ -626,20 +626,24 @@ def test_denoiser_from_file(
 def test_denoiser_from_folder(
         checkpoint_folder: Union[str, os.PathLike],
         data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
-        accumulation: bool = False
+        accumulation: bool = False,
+        use_last: bool = False
 ):
     """Selects speech enhancement model checkpoint from folder, and then
     evaluates using provided dataset.
     """
     # identify the best checkpoint using saved text file
     checkpoint_folder = pathlib.Path(checkpoint_folder)
-    best_step_file = checkpoint_folder.joinpath('best_step.txt')
-    if not best_step_file.exists():
-        raise ValueError(f'Could not find {str(best_step_file)}.')
-    with open(best_step_file, 'r') as fp:
-        best_step = int(fp.readline())
+    if use_last:
+        checkpoint_path = checkpoint_folder.joinpath(f'ckpt_last.pt')
+    else:
+        best_step_file = checkpoint_folder.joinpath('best_step.txt')
+        if not best_step_file.exists():
+            raise ValueError(f'Could not find {str(best_step_file)}.')
+        with open(best_step_file, 'r') as fp:
+            best_step = int(fp.readline())
 
-    checkpoint_path = checkpoint_folder.joinpath(f'ckpt_{best_step:08}.pt')
+        checkpoint_path = checkpoint_folder.joinpath(f'ckpt_{best_step:08}.pt')
     if not checkpoint_path.exists():
         raise IOError(f'{str(checkpoint_path)} does not exist.')
     print(f'Using {checkpoint_path}...')
@@ -651,14 +655,16 @@ def test_denoiser_from_folder(
 def test_denoiser(
         model: Union[str, os.PathLike, torch.nn.Module],
         data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
-        accumulation: bool = False
+        accumulation: bool = False,
+        use_last: bool = False
 ):
     if isinstance(model, torch.nn.Module):
         return test_denoiser_from_module(model, data_te, accumulation)
     elif isinstance(model, (str, os.PathLike)):
         path = pathlib.Path(model)
         if path.is_dir():
-            return test_denoiser_from_folder(path, data_te, accumulation)
+            return test_denoiser_from_folder(path, data_te, accumulation,
+                                             use_last)
         elif path.is_file():
             return test_denoiser_from_file(path, data_te, accumulation)
         else:
