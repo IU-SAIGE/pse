@@ -2,11 +2,12 @@ import argparse
 import itertools
 import json
 import os
-import pathlib
+import sys
 import warnings
 from datetime import datetime
 from math import ceil
-from typing import Optional
+from pathlib import Path
+from typing import Optional, List
 from typing import Union
 
 import numpy as np
@@ -17,8 +18,8 @@ from torch.utils.tensorboard import SummaryWriter
 from exp_data import ContrastiveMixtures, Mixtures
 from exp_data import example_duration, sample_rate
 from exp_data import speaker_ids_tr, speaker_ids_vl, speaker_ids_te
-from exp_models import init_model, contrastive_feedforward, feedforward
-from exp_models import SNRPredictor, test_denoiser_from_folder
+from exp_models import SNRPredictor, init_model
+from exp_models import contrastive_feedforward, feedforward
 from exp_utils import EarlyStopping, ExperimentError
 
 warnings.filterwarnings('ignore')
@@ -28,7 +29,7 @@ def save_config(
         output_directory: Union[str, os.PathLike],
         config: dict
 ):
-    output_directory = pathlib.Path(output_directory)
+    output_directory = Path(output_directory)
     with open(output_directory.joinpath('config.json'), 'w',
               encoding='utf-8') as fp:
         json.dump(config, fp, indent=2, sort_keys=True)
@@ -42,11 +43,13 @@ def train_denoiser(
         data_vl: Mixtures,
         use_loss_purification: bool = False,
         learning_rate: float = 1e-3,
-        batch_size: int = 8,
+        batch_size: int = 64,
         checkpoint_path: Optional[str] = None,
         num_examples_validation: int = 1000,
         num_examples_earlystopping: int = 100000,
-        trial_name: Optional[str] = None
+        trial_name: Optional[str] = None,
+        output_folder: Union[str, os.PathLike] = 'runs',
+        training_metric: str = 'sisdri'
 ) -> str:
     # prepare model, optimizer, and loss function
     model, nparams, model_config = init_model(model_name, model_size)
@@ -65,7 +68,10 @@ def train_denoiser(
 
     # load a previous checkpoint if provided
     init_num_examples = 0
+    output_directory: Optional[Path] = None
     if checkpoint_path:
+        # overwrite output directory (to pick up experiment where left off)
+        output_directory = Path(checkpoint_path).parent
         ckpt = torch.load(checkpoint_path)
         model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -89,20 +95,22 @@ def train_denoiser(
         'speaker_ids': data_tr.speaker_ids_repr,
         'use_loss_contrastive': use_loss_contrastive,
         'use_loss_purification': use_loss_purification,
+        'training_metric': training_metric
     }
 
     # instantiate tensorboard
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
-    output_directory = pathlib.Path('runs').joinpath(
-        current_time + '_' + trial_name) # trial_name(config=config))
+    if output_directory is None:
+        output_directory = Path(output_folder).joinpath(
+            current_time + '_' + trial_name)
     writer = SummaryWriter(str(output_directory))
     save_config(output_directory, config)
 
     # begin training (use gradient accumulation for TasNet models)
     num_examples: int = init_num_examples
     num_validations: int = ceil(num_examples / num_examples_validation)
-    min_loss: float = np.inf
-    min_loss_num_examples: int = init_num_examples
+    best_score: float = np.inf * (1 if training_metric == 'mse' else -1)
+    best_score_step: int = init_num_examples
     use_gradient_accumulation: bool = bool('tasnet' in model_name)
     print(f'Output Directory: {str(output_directory)}')
 
@@ -153,7 +161,7 @@ def train_denoiser(
             optimizer.step()
             optimizer.zero_grad()
 
-            if num_examples > (num_validations * num_examples_validation):
+            if num_examples < (num_validations * num_examples_validation):
                 continue
 
             num_validations += 1
@@ -210,9 +218,17 @@ def train_denoiser(
                                   float(sisdri_vl), num_examples)
 
                 # checkpoint whenever validation score improves
-                if loss_vl < min_loss:
-                    min_loss = loss_vl
-                    min_loss_num_examples = num_examples
+                if training_metric == 'mse':
+                    save_ckpt = bool(float(loss_vl)<=best_score)
+                else:
+                    save_ckpt = bool(float(sisdri_vl)>=best_score)
+
+                if save_ckpt:
+                    if training_metric == 'mse':
+                        best_score = float(loss_vl)
+                    else:
+                        best_score = float(sisdri_vl)
+                    best_score_step = num_examples
                     ckpt_path = output_directory.joinpath(
                         f'ckpt_{num_examples:08}.pt')
                     torch.save({
@@ -226,20 +242,19 @@ def train_denoiser(
                     with open(step_path, 'w') as fp:
                         print(num_examples, file=fp)
 
-                if (num_examples - min_loss_num_examples >
-                        num_examples_earlystopping):
+                if num_examples - best_score_step > num_examples_earlystopping:
                     raise EarlyStopping()
 
     except EarlyStopping:
         step_path = output_directory.joinpath(f'early_stopping.txt')
         with open(step_path, 'w') as fp:
-            print('{},{}'.format(num_examples, min_loss_num_examples), file=fp)
+            print('{},{}'.format(num_examples, best_score_step), file=fp)
         print(f'Automatically exited after {num_examples_earlystopping} '
-              f'examples; best model saw {min_loss_num_examples} examples.')
+              f'examples; best model saw {best_score_step} examples.')
 
     except KeyboardInterrupt:
         print(f'Manually exited at {num_examples} examples; best model saw '
-              f'{min_loss_num_examples} examples.')
+              f'{best_score_step} examples.')
 
     torch.save({
         'num_examples': num_examples,
@@ -259,7 +274,12 @@ def train_denoiser(
     return str(output_directory)
 
 
-def parse_arguments():
+def parse_arguments(arg_list: Optional[List[str]] = None):
+
+    # use system default arguments
+    if arg_list is None: arg_list = sys.argv[1:]
+    abs_path = lambda p: Path(p).absolute()
+
     parser = argparse.ArgumentParser()
     parser.add_argument('model_name', type=str)
     parser.add_argument('model_size', type=str,
@@ -269,12 +289,33 @@ def parse_arguments():
     parser.add_argument('-l', '--learning_rate', type=float, default=1e-3)
     parser.add_argument('--use_loss_purification', action='store_true')
     parser.add_argument('--use_loss_contrastive', action='store_true')
-    return parser.parse_args()
+    parser.add_argument('--training_metric', type=str,
+                        choices={'mse', 'sisdri'}, default='sisdri')
+    parser.add_argument('--warm_start', type=abs_path)
+    parser.add_argument('--output_folder', type=abs_path,
+                        default=abs_path(__file__).parent / 'runs')
+    args = parser.parse_args(arg_list)
+
+    # validate warm start argument
+    if args.warm_start:
+        if Path(args.warm_start).suffix != '.pt':
+            raise IOError('Warm start checkpoint should have extension ".pt".')
+        if not Path(args.warm_start).is_file():
+            raise IOError('Warm start checkpoint does not exist.')
+        args.warm_start = str(args.warm_start)
+
+    # validate speaker IDs
+    if args.speaker_id:
+        # check that speaker IDs are valid for personalization experiments
+        if not set(args.speaker_id).issubset(set(speaker_ids_te)):
+            raise ExperimentError(
+                'Please choose speaker IDs specificed in "speakers/test.csv". '
+                'Allowed values are: {}.'.format(speaker_ids_te))
+    return args
 
 
 def main():
     args = parse_arguments()
-    print(args)
 
     dataset_class = Mixtures
     if args.use_loss_contrastive:
@@ -283,22 +324,15 @@ def main():
     # train one or more specialist models
     if args.speaker_id:
 
-        # check that speaker IDs are valid for personalization experiments
-        if not set(args.speaker_id).issubset(set(speaker_ids_te)):
-            raise ExperimentError(
-                'Please choose speaker IDs specificed in "speakers/test.csv". '
-                'Allowed values are: {}.'.format(speaker_ids_te))
-
         for speaker_id in args.speaker_id:
 
             d_tr = dataset_class(speaker_id, split_speech='pretrain',
                             split_premixture='train', split_mixture='train',
-                            snr_premixture=(0, 10), snr_mixture=(-5, 5))
+                            snr_premixture=(0, 15), snr_mixture=(-5, 5))
             d_vl = dataset_class(speaker_id, split_speech='preval',
                             split_premixture='val', split_mixture='val',
-                            snr_premixture=(0, 10), snr_mixture=(-5, 5))
-
-            results_directory = train_denoiser(
+                            snr_premixture=(0, 15), snr_mixture=(-5, 5))
+            train_denoiser(
                 model_name=args.model_name,
                 model_size=args.model_size,
                 data_tr=d_tr,
@@ -308,11 +342,13 @@ def main():
                 use_loss_purification=args.use_loss_purification,
                 trial_name='{}_{}_sp{:03}{}{}'.format(
                     args.model_name, args.model_size, speaker_id,
-                    '_cm' if args.use_loss_contrastive else '',
-                    '_dp' if args.use_loss_purification else ''
-                )
+                    '_yp' if args.use_loss_purification else '_np',
+                    '_yc' if args.use_loss_contrastive else '_nc'
+                ),
+                training_metric=args.training_metric,
+                checkpoint_path=args.warm_start,
+                output_folder=str(args.output_folder)
             )
-            print(test_denoiser_from_folder(results_directory))
 
     # train one generalist model
     else:
@@ -323,8 +359,7 @@ def main():
         d_vl = dataset_class(speaker_ids_vl,
                              split_mixture='val',
                              snr_mixture=(-5, 5))
-
-        results_directory = train_denoiser(
+        train_denoiser(
             model_name=args.model_name,
             model_size=args.model_size,
             data_tr=d_tr,
@@ -333,10 +368,11 @@ def main():
             batch_size=args.batch_size,
             trial_name='{}_{}'.format(
                 args.model_name, args.model_size
-            )
+            ),
+            training_metric=args.training_metric,
+            checkpoint_path=args.warm_start,
+            output_folder=str(args.output_folder)
         )
-        print(test_denoiser_from_folder(results_directory))
-
     return
 
 
