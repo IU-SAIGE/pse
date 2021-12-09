@@ -2,6 +2,7 @@ import argparse
 import itertools
 import json
 import os
+import socket
 import sys
 import warnings
 from datetime import datetime
@@ -24,6 +25,7 @@ from exp_utils import EarlyStopping, ExperimentError
 
 warnings.filterwarnings('ignore')
 
+_host = str(socket.gethostname().split('.')[-3:].pop(0))
 
 def save_config(
         output_directory: Union[str, os.PathLike],
@@ -48,7 +50,7 @@ def train_denoiser(
         num_examples_validation: int = 1000,
         num_examples_earlystopping: int = 100000,
         trial_name: Optional[str] = None,
-        output_folder: Union[str, os.PathLike] = 'runs',
+        output_folder: Union[str, os.PathLike] = f'runs_{_host}',
         training_metric: str = 'sisdri'
 ) -> str:
     # prepare model, optimizer, and loss function
@@ -293,7 +295,7 @@ def parse_arguments(arg_list: Optional[List[str]] = None):
                         choices={'mse', 'sisdri'}, default='sisdri')
     parser.add_argument('--warm_start', type=abs_path)
     parser.add_argument('--output_folder', type=abs_path,
-                        default=abs_path(__file__).parent / 'runs')
+                        default=abs_path(__file__).parent / f'runs_{_host}')
     args = parser.parse_args(arg_list)
 
     # validate warm start argument
@@ -340,10 +342,11 @@ def main():
                 learning_rate=args.learning_rate,
                 batch_size=args.batch_size,
                 use_loss_purification=args.use_loss_purification,
-                trial_name='{}_{}_sp{:03}{}{}'.format(
-                    args.model_name, args.model_size, speaker_id,
+                trial_name='{}_{}{}{}_sp{:03}'.format(
+                    args.model_name, args.model_size,
                     '_yp' if args.use_loss_purification else '_np',
-                    '_yc' if args.use_loss_contrastive else '_nc'
+                    '_yc' if args.use_loss_contrastive else '_nc',
+                    speaker_id
                 ),
                 training_metric=args.training_metric,
                 checkpoint_path=args.warm_start,
