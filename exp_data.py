@@ -25,6 +25,7 @@ _root_demand: str = '/data/asivara/demand_1ch/'
 _root_fsd50k: str = '/data/asivara/fsd50k_16khz/'
 _root_musan: str = '/data/asivara/musan/'
 _root_irsurvey: str = '/data/asivara/ir_survey_16khz/'
+_root_slr28: str = '/data/asivara/RIRS_NOISES/'
 
 _eps: float = 1e-8
 _rng = np.random.default_rng(0)
@@ -569,7 +570,7 @@ def dataframe_irsurvey(
         rows, columns=['name', 'frequency', 'duration', 'filepath'])
 
     # shuffle the recordings
-    df = df.sample(frac=1, random_state=200)
+    df = df.sample(frac=1, random_state=200).reset_index(drop=True)
 
     # organize by split
     df['split'] = 'train'
@@ -584,6 +585,75 @@ def dataframe_irsurvey(
     df = df[['filepath', 'split', 'duration', 'frequency']]
     df = df.reset_index(drop=True)
     df.index.name = 'IR_SURVEY'
+    return df
+
+
+def dataframe_slr28(
+        dataset_directory: Union[str, os.PathLike] = _root_slr28
+) -> pd.DataFrame:
+    """Creates a Pandas DataFrame with files from the 2017 ICASSP paper,
+    "A Study on Data Augmentation of Reverberant Speech for Robust Speech
+    Recognition". Root directory should mimic archive-extracted folder
+    structure. Dataset may be downloaded at `<https://www.openslr.org/28/>`_.
+    """
+    def parse_rir_list(filepath: str, real: bool = False):
+        sublist = []
+        fp = pathlib.Path(filepath)
+        if not fp.exists():
+            fp = pathlib.Path(dataset_directory).joinpath(fp)
+            if not fp.exists():
+                raise IOError(f'Missing rir_list {str(fp)}.')
+        i_type = 'real' if real else 'simulated'
+        for line in open(fp).read().splitlines():
+            parts = line.split()
+            i_id, i_room = str(parts[1]), str(parts[3])
+            i_filepath = pathlib.Path(dataset_directory).joinpath(
+                str(parts[4]).replace('RIRS_NOISES/', '')
+            )
+            if not i_filepath.exists():
+                raise IOError(f'Missing file {i_filepath}.')
+            sublist.append((i_type, i_id, i_room, str(i_filepath)))
+        return sublist
+
+    # add the real impulse responses
+    rows = parse_rir_list('real_rirs_isotropic_noises/rir_list', real=True)
+    df_real = pd.DataFrame(
+        rows, columns=['type', 'id', 'room', 'filepath'])
+
+    # shuffle the recordings
+    df_real = df_real.sample(
+        frac=1, random_state=0).reset_index(drop=True)
+    nrows = len(df_real)
+
+    # organize by split
+    df_real['split'] = 'train'
+    df_real.loc[int(nrows * .8):int(nrows * .9), 'split'] = 'val'
+    df_real.loc[int(nrows * .9):, 'split'] = 'test'
+
+    # add the synthetic impulse responses
+    rows = []
+    rows += parse_rir_list('simulated_rirs/smallroom/rir_list')
+    rows += parse_rir_list('simulated_rirs/mediumroom/rir_list')
+    rows += parse_rir_list('simulated_rirs/largeroom/rir_list')
+    df_synth = pd.DataFrame(
+        rows, columns=['type', 'id', 'room', 'filepath'])
+
+    # shuffle the recordings
+    df_synth = df_synth.sample(
+        frac=1, random_state=0).reset_index(drop=True)
+    nrows = len(df_synth)
+
+    # organize by split
+    df_synth['split'] = 'train'
+    df_synth.loc[int(nrows * .8):int(nrows * .9), 'split'] = 'val'
+    df_synth.loc[int(nrows * .9):, 'split'] = 'test'
+
+    # combine real and synthetic
+    df = pd.concat((df_real, df_synth))
+
+    # reindex and name the dataframe
+    df = df.reset_index(drop=True)
+    df.index.name = 'SLR28'
     return df
 
 
@@ -966,6 +1036,7 @@ df_musan = dataframe_musan()
 df_fsd50k = dataframe_fsd50k()
 df_demand = dataframe_demand()
 df_irsurvey = dataframe_irsurvey()
+df_slr28 = dataframe_slr28()
 speaker_ids_tr, speaker_ids_vl, speaker_ids_te = split_speakers(False)
 speaker_ids_all = speaker_ids_tr + speaker_ids_vl + speaker_ids_te
 speaker_split_durations = df_librispeech.groupby(
