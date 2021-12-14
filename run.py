@@ -54,6 +54,7 @@ def train_denoiser(
         training_metric: str = 'sisdri'
 ) -> str:
     # prepare model, optimizer, and loss function
+    current_time = datetime.now().strftime('%b%d_%H-%M-%S')
     model, nparams, model_config = init_model(model_name, model_size)
     model = model.cuda()
     optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
@@ -71,12 +72,19 @@ def train_denoiser(
     # load a previous checkpoint if provided
     init_num_examples = 0
     output_directory: Optional[Path] = None
+    is_finetuning = bool(data_tr.dataset_duration or 0)
     if checkpoint_path:
-        # overwrite output directory (to pick up experiment where left off)
+        # reuse output directory (to pick up experiment where left off)
         output_directory = Path(checkpoint_path).parent
         ckpt = torch.load(checkpoint_path)
         model.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        # if finetuning a generalist, make a subdirectory
+        if is_finetuning:
+            output_directory = output_directory.joinpath(
+                current_time + '_ft_' + trial_name)
+        # otherwise, resuming training so reuse the old optimizer
+        else:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         init_num_examples = ckpt['num_examples']
 
     # define experiment configuration
@@ -97,11 +105,11 @@ def train_denoiser(
         'speaker_ids': data_tr.speaker_ids_repr,
         'use_loss_contrastive': use_loss_contrastive,
         'use_loss_purification': use_loss_purification,
-        'training_metric': training_metric
+        'training_metric': training_metric,
+        'is_finetuning': is_finetuning
     }
 
     # instantiate tensorboard
-    current_time = datetime.now().strftime('%b%d_%H-%M-%S')
     if output_directory is None:
         output_directory = Path(output_folder).joinpath(
             current_time + '_' + trial_name)
@@ -231,8 +239,12 @@ def train_denoiser(
                     else:
                         best_score = float(sisdri_vl)
                     best_score_step = num_examples
+                    finetune_suffix = ''
+                    if data_tr.dataset_duration:
+                        finetune_suffix = (
+                            f'_ft_{int(data_tr.dataset_duration):02d}')
                     ckpt_path = output_directory.joinpath(
-                        f'ckpt_{num_examples:08}.pt')
+                        f'ckpt_best{finetune_suffix}.pt')
                     torch.save({
                         'num_examples': num_examples,
                         'model_name': model_name,
@@ -240,7 +252,9 @@ def train_denoiser(
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict()
                     }, ckpt_path)
-                    step_path = output_directory.joinpath(f'best_step.txt')
+                    print(f'Saved {ckpt_path} ...')
+                    step_path = output_directory.joinpath(
+                        f'best_step{finetune_suffix}.txt')
                     with open(step_path, 'w') as fp:
                         print(num_examples, file=fp)
 
@@ -291,6 +305,7 @@ def parse_arguments(arg_list: Optional[List[str]] = None):
     parser.add_argument('-l', '--learning_rate', type=float, default=1e-3)
     parser.add_argument('--use_loss_purification', action='store_true')
     parser.add_argument('--use_loss_contrastive', action='store_true')
+    parser.add_argument('--finetune', type=int, default=0)
     parser.add_argument('--training_metric', type=str,
                         choices={'mse', 'sisdri'}, default='sisdri')
     parser.add_argument('--warm_start', type=abs_path)
@@ -328,12 +343,33 @@ def main():
 
         for speaker_id in args.speaker_id:
 
-            d_tr = dataset_class(speaker_id, split_speech='pretrain',
-                            split_premixture='train', split_mixture='train',
-                            snr_premixture=(0, 15), snr_mixture=(-5, 5))
-            d_vl = dataset_class(speaker_id, split_speech='preval',
-                            split_premixture='val', split_mixture='val',
-                            snr_premixture=(0, 15), snr_mixture=(-5, 5))
+            if args.finetune > 0:
+                if not args.warm_start:
+                    raise ExperimentError('Need a checkpoint to fine-tune, '
+                                          'use the --warm_start parameter.')
+                d_tr = dataset_class(speaker_id,
+                                     split_speech='train',
+                                     split_mixture='train',
+                                     snr_mixture=(-5, 5),
+                                     dataset_duration=args.finetune)
+                d_vl = dataset_class(speaker_id,
+                                     split_speech='val',
+                                     split_mixture='val',
+                                     snr_mixture=(-5, 5),
+                                     dataset_duration=args.finetune)
+            else:
+                d_tr = dataset_class(speaker_id,
+                                     split_speech='pretrain',
+                                     split_premixture='train',
+                                     snr_premixture=(0, 15),
+                                     split_mixture='train',
+                                     snr_mixture=(-5, 5))
+                d_vl = dataset_class(speaker_id,
+                                     split_speech='preval',
+                                     split_premixture='val',
+                                     snr_premixture=(0, 15),
+                                     split_mixture='val',
+                                     snr_mixture=(-5, 5))
             train_denoiser(
                 model_name=args.model_name,
                 model_size=args.model_size,

@@ -615,9 +615,15 @@ def test_denoiser_from_file(
 
     model = init_model(model_name=config.get('model_name'),
                        model_size=config.get('model_size'))[0]
-    model.load_state_dict(torch.load(checkpoint_path).get('model_state_dict'),
-                          strict=True)
+    ckpt = torch.load(checkpoint_path)
+    num_examples = ckpt.get('num_examples')
+    suffix = ''
+    if str(num_examples) not in str(checkpoint_path):
+        suffix = ' ({})'.format(ckpt.get('num_examples'))
+    model.load_state_dict(ckpt.get('model_state_dict'), strict=True)
     model.cuda()
+
+    print(f'Using {checkpoint_path}{suffix} ...')
 
     return test_denoiser_from_module(model, data_te, accumulation)
 
@@ -627,26 +633,30 @@ def test_denoiser_from_folder(
         checkpoint_folder: Union[str, os.PathLike],
         data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
         accumulation: bool = False,
+        finetune: int = 0,
         use_last: bool = False
 ):
     """Selects speech enhancement model checkpoint from folder, and then
     evaluates using provided dataset.
     """
+    finetune_suffix = f'_ft_{int(finetune):02d}' if finetune else ''
     # identify the best checkpoint using saved text file
     checkpoint_folder = pathlib.Path(checkpoint_folder)
     if use_last:
         checkpoint_path = checkpoint_folder.joinpath(f'ckpt_last.pt')
+    elif checkpoint_folder.joinpath(f'ckpt_best{finetune_suffix}.pt').exists():
+        checkpoint_path = checkpoint_folder.joinpath(
+            f'ckpt_best{finetune_suffix}.pt')
     else:
-        best_step_file = checkpoint_folder.joinpath('best_step.txt')
+        best_step_file = next(checkpoint_folder.glob('best_step*'))
         if not best_step_file.exists():
             raise ValueError(f'Could not find {str(best_step_file)}.')
         with open(best_step_file, 'r') as fp:
             best_step = int(fp.readline())
-
-        checkpoint_path = checkpoint_folder.joinpath(f'ckpt_{best_step:08}.pt')
+        checkpoint_path = checkpoint_folder.joinpath(
+            f'ckpt_{best_step:08}{finetune_suffix}.pt')
     if not checkpoint_path.exists():
         raise IOError(f'{str(checkpoint_path)} does not exist.')
-    print(f'Using {checkpoint_path}...')
 
     return test_denoiser_from_file(checkpoint_path, data_te, accumulation)
 
@@ -656,6 +666,7 @@ def test_denoiser(
         model: Union[str, os.PathLike, torch.nn.Module],
         data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
         accumulation: bool = False,
+        finetune: int = 0,
         use_last: bool = False
 ):
     if isinstance(model, torch.nn.Module):
@@ -664,7 +675,7 @@ def test_denoiser(
         path = pathlib.Path(model)
         if path.is_dir():
             return test_denoiser_from_folder(path, data_te, accumulation,
-                                             use_last)
+                                             finetune, use_last)
         elif path.is_file():
             return test_denoiser_from_file(path, data_te, accumulation)
         else:

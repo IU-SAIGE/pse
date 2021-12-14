@@ -20,12 +20,12 @@ example_duration: float = 4
 sample_rate: int = 16000
 example_length: int = int(sample_rate * example_duration)
 
-_root_librispeech: str = '/data/asivara/librispeech/'
-_root_demand: str = '/data/asivara/demand_1ch/'
-_root_fsd50k: str = '/data/asivara/fsd50k_16khz/'
-_root_musan: str = '/data/asivara/musan/'
-_root_irsurvey: str = '/data/asivara/ir_survey_16khz/'
-_root_slr28: str = '/data/asivara/RIRS_NOISES/'
+_root_librispeech: str = '/N/u/asivara/datasets/librispeech/'
+_root_demand: str = '/N/u/asivara/datasets/demand/'
+_root_fsd50k: str = '/N/u/asivara/datasets/fsd50k_16khz/'
+_root_musan: str = '/N/u/asivara/datasets/musan/'
+_root_irsurvey: str = '/N/u/asivara/datasets/ir_survey_16khz/'
+_root_slr28: str = '/N/u/asivara/datasets/RIRS_NOISES/'
 
 _eps: float = 1e-8
 _rng = np.random.default_rng(0)
@@ -136,6 +136,16 @@ def wav_read_multiple(
         signals.append(s)
     return collate_fn(signals, axis=0)
 
+
+def wav_sample(
+        data: np.ndarray,
+        num_clips: int,
+        seed: Optional[int] = None
+) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    start_indices = rng.integers(0, len(data) - example_length - 1, num_clips)
+    signals = [data[i:i+example_length] for i in start_indices]
+    return np.stack(signals, axis=0)
 
 def sisdr(
         estimate: torch.Tensor,
@@ -702,7 +712,7 @@ class Mixtures:
             corpus_mixture: str = 'musan',
             snr_premixture: Optional[Union[float, Tuple[float, float]]] = None,
             snr_mixture: Optional[Union[float, Tuple[float, float]]] = None,
-            dataset_duration: Optional[float] = None
+            dataset_duration: int = 0
     ):
         # verify speaker ID(s)
         if isinstance(speaker_id_or_ids, int):
@@ -787,7 +797,7 @@ class Mixtures:
         # verify dataset duration
         if not isinstance(dataset_duration, (int, float, type(None))):
             raise ValueError('Expected `dataset_duration` to be a number.')
-        self.dataset_duration = dataset_duration
+        self.dataset_duration = int(dataset_duration or 0)
 
         self.index = 0
         self.example_duration = example_duration
@@ -822,6 +832,15 @@ class Mixtures:
         if self.len_s < 1:
             raise ValueError('Invalid speaker_id')
 
+        # if a dataset duration is provided,
+        # truncate the audio data to the expected size
+        self.speech_data = np.array([])
+        if self.dataset_duration:
+            self.speech_data = wav_read_multiple(
+                self.corpus_s.filepath, concatenate=True)
+            self.speech_data = self.speech_data[:(
+                    self.dataset_duration * sample_rate)]
+
         # define flags
         self.is_personalized = bool(len(self.speaker_ids) == 1)
         self.add_premixture_noise = bool(
@@ -832,6 +851,10 @@ class Mixtures:
 
         if not self.is_personalized and self.add_premixture_noise:
             raise ExperimentError('Non-personalized dataset contains '
+                                  'premixture noise.')
+
+        if self.dataset_duration and self.add_premixture_noise:
+            raise ExperimentError('Fine-tuning dataset contains '
                                   'premixture noise.')
 
     def __dict__(self):
@@ -875,10 +898,13 @@ class Mixtures:
         r_filepaths = (list(self.corpus_r.filepath.iloc[indices % self.len_r])
                        if self.len_r else [])
 
-        s = wav_read_multiple(s_filepaths, seed=seed)
+        if self.speech_data.size > 0:
+            s = wav_sample(self.speech_data, batch_size, seed=seed)
+        else:
+            s = wav_read_multiple(s_filepaths, seed=seed)
         x = p = s
 
-        pre_snrs = np.array(np.nan * np.ones(batch_size))
+        pre_snrs = np.array([])
         if self.add_premixture_noise:
             m = wav_read_multiple(m_filepaths, seed=seed)
             pre_snrs = tmp_rng.uniform(
@@ -894,7 +920,7 @@ class Mixtures:
                 p_rev[i] = convolve(p[i], filt, mode='full')[:p_len]
             x = p = p_rev
 
-        post_snrs = np.array(np.nan * np.ones(batch_size))
+        post_snrs = np.array([])
         if self.add_noise:
             n = wav_read_multiple(n_filepaths, seed=seed)
             post_snrs = tmp_rng.uniform(
@@ -954,10 +980,17 @@ class ContrastiveMixtures(Mixtures):
 
             is_positive = bool(i/2 < num_positive)
 
-            if is_positive:
-                s_1 = s_2 = wav_read_multiple([s_filepaths[i]], seed=seed)
+            if self.speech_data.size > 0:
+                if is_positive:
+                    s_1 = s_2 = wav_sample(self.speech_data, 1, seed=seed)
+                else:
+                    s_1, s_2 = wav_sample(self.speech_data, 2, seed=seed)
             else:
-                s_1, s_2 = wav_read_multiple(s_filepaths[i:i+2], seed=seed)
+                if is_positive:
+                    s_1 = s_2 = wav_read_multiple([s_filepaths[i]], seed=seed)
+                else:
+                    s_1, s_2 = wav_read_multiple(s_filepaths[i:i+2], seed=seed)
+
             s_1, s_2 = s_1.reshape(-1), s_2.reshape(-1)
 
             p_1, p_2 = s_1, s_2
@@ -1004,16 +1037,20 @@ class ContrastiveMixtures(Mixtures):
             bp_2.append(p_2)
             bx_1.append(x_1)
             bx_2.append(x_2)
-            bpre_snrs.append(pre_snr)
-            bpost_snrs.append(post_snr)
+            if pre_snr[0]:
+                bpre_snrs.append(pre_snr)
+            if post_snr[0]:
+                bpost_snrs.append(post_snr)
 
         # stack and shuffle all the data in the right order
         bp_1 = np.stack(bp_1)[ordering]
         bp_2 = np.stack(bp_2)[ordering]
         bx_1 = np.stack(bx_1)[ordering]
         bx_2 = np.stack(bx_2)[ordering]
-        bpre_snrs = np.stack(bpre_snrs)[ordering]
-        bpost_snrs = np.stack(bpost_snrs)[ordering]
+        if bpre_snrs:
+            bpre_snrs = np.stack(bpre_snrs)[ordering]
+        if bpost_snrs:
+            bpost_snrs = np.stack(bpost_snrs)[ordering]
         labels = labels[ordering]
 
         scale_factor_1 = float(np.abs(bx_1).max() + _eps)
@@ -1036,7 +1073,7 @@ df_musan = dataframe_musan()
 df_fsd50k = dataframe_fsd50k()
 df_demand = dataframe_demand()
 df_irsurvey = dataframe_irsurvey()
-df_slr28 = dataframe_slr28()
+df_slr28 = None # dataframe_slr28()
 speaker_ids_tr, speaker_ids_vl, speaker_ids_te = split_speakers(False)
 speaker_ids_all = speaker_ids_tr + speaker_ids_vl + speaker_ids_te
 speaker_split_durations = df_librispeech.groupby(
