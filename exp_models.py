@@ -98,6 +98,11 @@ class DPRNNTasNet(asteroid.models.DPRNNTasNet):
         forward = _forward_single_mask
 
 
+class DPTNet(asteroid.models.DPTNet):
+    if _recover_noise:
+        forward = _forward_single_mask
+
+
 class GRUNet(torch.nn.Module):
 
     def __init__(self, hidden_size: int, num_layers: int = 2):
@@ -515,6 +520,21 @@ def init_dprnn(N=64, L=2, B=128, H=128, R=6, K=250, causal=False):
     ), model_config)
 
 
+def init_dpt(N=64, L=2, H=256, R=6, K=250, causal=False):
+    model_config = locals()
+    return (DPTNet(
+        n_src=1,
+        sample_rate=sample_rate,
+        n_filters=N,
+        kernel_size=L,
+        stride=L//2,
+        ff_hid=H,
+        n_repeats=R,
+        chunk_size=K,
+        bidirectional=(not causal)
+    ), model_config)
+
+
 def init_gru(hidden_size=64, num_layers=2):
     model_config = locals()
     return (GRUNet(
@@ -554,6 +574,15 @@ def init_model(
                 'small': dict(B=64, H=64, R=1),
                 'medium': dict(B=64, H=128, R=1),
                 'large': dict(B=128, H=128, R=2)
+            }.get(model_size))
+    elif model_name == 'dptnet':
+        if model_config:
+            model, model_config = init_dpt(**model_config)
+        else:
+            model, model_config = init_dpt(**{
+                'small': dict(R=2, H=36),
+                'medium': dict(R=2, H=72),
+                'large': dict(R=2, H=144)
             }.get(model_size))
     elif model_name == 'grunet':
         if model_config:
