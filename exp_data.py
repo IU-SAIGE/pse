@@ -20,12 +20,12 @@ example_duration: float = 4
 sample_rate: int = 16000
 example_length: int = int(sample_rate * example_duration)
 
-_root_librispeech: str = '/N/u/asivara/datasets/librispeech/'
-_root_demand: str = '/N/u/asivara/datasets/demand/'
-_root_fsd50k: str = '/N/u/asivara/datasets/fsd50k_16khz/'
-_root_musan: str = '/N/u/asivara/datasets/musan/'
-_root_irsurvey: str = '/N/u/asivara/datasets/ir_survey_16khz/'
-_root_slr28: str = '/N/u/asivara/datasets/RIRS_NOISES/'
+_root_librispeech: str = '/data/asivara/librispeech/'
+_root_demand: str = '/data/asivara/demand/'
+_root_fsd50k: str = '/data/asivara/fsd50k_16khz/'
+_root_musan: str = '/data/asivara/musan/'
+_root_irsurvey: str = '/data/asivara/ir_survey_16khz/'
+_root_slr28: str = '/data/asivara/RIRS_NOISES/'
 
 _eps: float = 1e-8
 _rng = np.random.default_rng(0)
@@ -320,7 +320,7 @@ def dataframe_librispeech(
     df = df.sort_values(['subset_id', 'split'])
 
     # ensure that all the audio files exist
-    if not all(df.filepath.apply(os.path.isfile)):
+    if not all([f for f in df.filepath if os.path.isfile(f)]):
         raise ValueError(f'Audio files missing, check {dataset_directory}.')
 
     # reindex and name the dataframe
@@ -332,12 +332,15 @@ def dataframe_librispeech(
 
 
 def dataframe_demand(
-        dataset_directory: Union[str, os.PathLike] = _root_demand
+        dataset_directory: Union[str, os.PathLike] = _root_demand,
+        empty: bool = False,
 ) -> pd.DataFrame:
     """Creates a Pandas DataFrame with files from the DEMAND corpus.
     Root directory should mimic archive-extracted folder structure.
     Dataset may be downloaded at `<https://www.zenodo.org/record/1227121/>`_.
     """
+    if empty:
+        return pd.DataFrame(columns=['filepath', 'duration', 'sparsity'])
     dataset_directory = pathlib.Path(dataset_directory)
     if not dataset_directory.exists():
         raise ValueError(f'{dataset_directory} does not exist.')
@@ -407,7 +410,7 @@ def dataframe_demand(
     df = df.sample(frac=1, random_state=0)
 
     # ensure that all the audio files exist
-    if not all(df.filepath.apply(os.path.isfile)):
+    if not all([f for f in df.filepath if os.path.isfile(f)]):
         raise ValueError(f'Audio files missing, check {dataset_directory}.')
 
     # reindex and name the dataframe
@@ -418,7 +421,8 @@ def dataframe_demand(
 
 
 def dataframe_fsd50k(
-        dataset_directory: Union[str, os.PathLike] = _root_fsd50k
+        dataset_directory: Union[str, os.PathLike] = _root_fsd50k,
+        empty: bool = False,
 ) -> pd.DataFrame:
     """Creates a Pandas DataFrame with files from the FSD50K corpus.
     Root directory should mimic archive-extracted folder structure.
@@ -477,7 +481,7 @@ def dataframe_fsd50k(
     df = df.sort_values('split')
 
     # ensure that all the audio files exist
-    if not all(df.filepath.apply(os.path.isfile)):
+    if not all([f for f in df.filepath if os.path.isfile(f)]):
         raise ValueError(f'Audio files missing, check {dataset_directory}.')
 
     # reindex and name the dataframe
@@ -488,7 +492,8 @@ def dataframe_fsd50k(
 
 
 def dataframe_musan(
-        dataset_directory: Union[str, os.PathLike] = _root_musan
+        dataset_directory: Union[str, os.PathLike] = _root_musan,
+        empty: bool = False,
 ) -> pd.DataFrame:
     """Creates a Pandas DataFrame with files from the MUSAN corpus.
     Root directory should mimic archive-extracted folder structure.
@@ -540,7 +545,7 @@ def dataframe_musan(
     df = df.sample(frac=1, random_state=0)
 
     # ensure that all the audio files exist
-    if not all(df.filepath.apply(os.path.isfile)):
+    if not all([f for f in df.filepath if os.path.isfile(f)]):
         raise ValueError(f'Audio files missing, check {dataset_directory}.')
 
     # reindex and name the dataframe
@@ -551,13 +556,16 @@ def dataframe_musan(
 
 
 def dataframe_irsurvey(
-        dataset_directory: Union[str, os.PathLike] = _root_irsurvey
+        dataset_directory: Union[str, os.PathLike] = _root_irsurvey,
+        empty: bool = False,
 ) -> pd.DataFrame:
     """Creates a Pandas DataFrame with files from the MIT Acoustical
     Reverberation Scene Statistics Survey. Root directory should mimic
     archive-extracted folder structure. Dataset may be downloaded at
     `<https://mcdermottlab.mit.edu/Reverb/IR_Survey.html>`_.
     """
+    if empty:
+        return pd.DataFrame(columns=['filepath', 'split', 'duration', 'frequency'])
     rows = []
     files = sorted(pathlib.Path(dataset_directory).glob('*.wav'))
     if not len(files) == 270:
@@ -588,7 +596,7 @@ def dataframe_irsurvey(
     df.loc[int(270 * .9):, 'split'] = 'test'
 
     # ensure that all the audio files exist
-    if not all(df.filepath.apply(os.path.isfile)):
+    if not all([f for f in df.filepath if os.path.isfile(f)]):
         raise ValueError(f'Audio files missing, check {dataset_directory}.')
 
     # reindex and name the dataframe
@@ -599,13 +607,16 @@ def dataframe_irsurvey(
 
 
 def dataframe_slr28(
-        dataset_directory: Union[str, os.PathLike] = _root_slr28
+        dataset_directory: Union[str, os.PathLike] = _root_slr28,
+        empty: bool = False,
 ) -> pd.DataFrame:
     """Creates a Pandas DataFrame with files from the 2017 ICASSP paper,
     "A Study on Data Augmentation of Reverberant Speech for Robust Speech
     Recognition". Root directory should mimic archive-extracted folder
     structure. Dataset may be downloaded at `<https://www.openslr.org/28/>`_.
     """
+    if empty:
+        return pd.DataFrame(columns=['type', 'id', 'room', 'filepath'])
     def parse_rir_list(filepath: str, real: bool = False):
         sublist = []
         fp = pathlib.Path(filepath)
@@ -1071,9 +1082,9 @@ class ContrastiveMixtures(Mixtures):
 df_librispeech = dataframe_librispeech()
 df_musan = dataframe_musan()
 df_fsd50k = dataframe_fsd50k()
-df_demand = dataframe_demand()
-df_irsurvey = dataframe_irsurvey()
-df_slr28 = None # dataframe_slr28()
+df_demand = dataframe_demand(empty=True)
+df_irsurvey = dataframe_irsurvey(empty=True)
+df_slr28 = dataframe_slr28(empty=True)
 speaker_ids_tr, speaker_ids_vl, speaker_ids_te = split_speakers(False)
 speaker_ids_all = speaker_ids_tr + speaker_ids_vl + speaker_ids_te
 speaker_split_durations = df_librispeech.groupby(
