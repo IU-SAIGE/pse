@@ -44,6 +44,8 @@ def train_denoiser(
         data_tr: Mixtures,
         data_vl: Mixtures,
         use_loss_purification: bool = False,
+        lambda_p: float = 1.,
+        lambda_n: float = 1.,
         learning_rate: float = 1e-3,
         batch_size: int = 64,
         checkpoint_path: Optional[str] = None,
@@ -94,6 +96,8 @@ def train_denoiser(
         'data_tr': data_tr.__dict__(),
         'data_vl': data_vl.__dict__(),
         'example_duration': example_duration,
+        'lambda_p': lambda_p,
+        'lambda_n': lambda_n,
         'learning_rate': learning_rate,
         'model_config': model_config,
         'model_name': model_name,
@@ -121,7 +125,7 @@ def train_denoiser(
     num_validations: int = ceil(num_examples / num_examples_validation)
     best_score: float = np.inf * (1 if training_metric == 'mse' else -1)
     best_score_step: int = init_num_examples
-    use_gradient_accumulation: bool = bool('tasnet' in model_name)
+    use_gradient_accumulation: bool = not bool('grunet' in model_name)
     print(f'Output Directory: {str(output_directory)}')
 
     try:
@@ -146,7 +150,7 @@ def train_denoiser(
                     inputs_1=x_1, inputs_2=x_2,
                     targets_1=p_1, targets_2=p_2,
                     weights_1=w_1, weights_2=w_2,
-                    lambda_positive=1., lambda_negative=1.,
+                    lambda_positive=lambda_p, lambda_negative=lambda_n,
                     labels=batch.labels.cuda(),
                     model=model.cuda(),
                     accumulation=use_gradient_accumulation,
@@ -196,7 +200,7 @@ def train_denoiser(
                         inputs_1=x_1, inputs_2=x_2,
                         targets_1=p_1, targets_2=p_2,
                         weights_1=w_1, weights_2=w_2,
-                        lambda_positive=1., lambda_negative=1.,
+                        lambda_positive=lambda_p, lambda_negative=lambda_n,
                         labels=batch.labels.cuda(),
                         model=model.cuda(),
                         accumulation=use_gradient_accumulation,
@@ -305,6 +309,8 @@ def parse_arguments(arg_list: Optional[List[str]] = None):
     parser.add_argument('-l', '--learning_rate', type=float, default=1e-3)
     parser.add_argument('--use_loss_purification', action='store_true')
     parser.add_argument('--use_loss_contrastive', action='store_true')
+    parser.add_argument('--lambda_p', type=float, default=1.)
+    parser.add_argument('--lambda_n', type=float, default=1.)
     parser.add_argument('--finetune', type=int, default=0)
     parser.add_argument('--training_metric', type=str,
                         choices={'mse', 'sisdri'}, default='sisdri')
@@ -375,6 +381,8 @@ def main():
                 model_size=args.model_size,
                 data_tr=d_tr,
                 data_vl=d_vl,
+                lambda_p=args.lambda_p,
+                lambda_n=args.lambda_n,
                 learning_rate=args.learning_rate,
                 batch_size=args.batch_size,
                 use_loss_purification=args.use_loss_purification,
@@ -403,6 +411,8 @@ def main():
             model_size=args.model_size,
             data_tr=d_tr,
             data_vl=d_vl,
+            lambda_p=args.lambda_p,
+            lambda_n=args.lambda_n,
             learning_rate=args.learning_rate,
             batch_size=args.batch_size,
             trial_name='{}_{}'.format(
