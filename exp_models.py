@@ -14,7 +14,6 @@ from exp_data import Mixtures, sample_rate, sisdr_improvement, \
     data_te_generalist
 from exp_utils import make_2d, make_3d, pad_x_to_y, shape_reconstructed
 
-
 _fft_size: int = 1024
 _hop_size: int = 256
 _eps: float = 1e-8
@@ -105,21 +104,24 @@ class DPTNet(asteroid.models.DPTNet):
 
 class GRUNet(torch.nn.Module):
 
-    def __init__(self, hidden_size: int, num_layers: int = 2):
+    def __init__(self, hidden_size: int, num_layers: int = 2,
+                 bidirectional: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.bidirectional = bidirectional
 
         # create a neural network which predicts a TF binary ratio mask
         self.rnn = torch.nn.GRU(
             input_size=int(_fft_size // 2 + 1),
             hidden_size=self.hidden_size,
             num_layers=self.num_layers,
+            bidirectional=self.bidirectional,
             batch_first=True
         )
         self.dnn = torch.nn.Sequential(
             torch.nn.Linear(
-                in_features=self.hidden_size,
+                in_features=self.hidden_size * (1+self.bidirectional),
                 out_features=int(_fft_size // 2 + 1)
             ),
             torch.nn.Sigmoid()
@@ -288,16 +290,15 @@ def feedforward(
         model: torch.nn.Module,
         weights: Optional[torch.Tensor] = None,
         accumulation: bool = False,
-        validation: bool = False,
         test: bool = False
 ) -> Tuple[torch.Tensor, float]:
     """Runs a feedforward pass through a model by unraveling batched data.
     """
     batch_size = inputs.shape[0]
+    validation = not bool(model.training)
     context = torch.no_grad() if (validation or test) else suppress()
     sisdri = 0
     loss_tensor = torch.Tensor(0)
-    reduction = torch.mean
 
     with context:
         if accumulation:
@@ -314,10 +315,10 @@ def feedforward(
                 if not test:
                     if weights is not None:
                         w = weights[i].unsqueeze(0)
-                        loss_tensor = reduction(
+                        loss_tensor = torch.mean(
                             loss_wmse(y, t, w))
                     else:
-                        loss_tensor = reduction(
+                        loss_tensor = torch.mean(
                             loss_mse(y, t))
                 if not (validation or test):
                     loss_tensor.backward()
@@ -337,10 +338,10 @@ def feedforward(
             # compute loss
             if not test:
                 if weights is not None:
-                    loss_tensor = reduction(
+                    loss_tensor = torch.mean(
                         loss_wmse(estimates, targets, weights))
                 else:
-                    loss_tensor = reduction(
+                    loss_tensor = torch.mean(
                         loss_mse(estimates, targets))
 
             # backwards pass
@@ -348,7 +349,7 @@ def feedforward(
                 loss_tensor.backward()
 
             # calculate signal improvement
-            sisdri = float(reduction(
+            sisdri = float(torch.mean(
                 sisdr_improvement(estimates, targets, inputs)))
 
     return loss_tensor, sisdri
@@ -505,7 +506,7 @@ def init_ctn(N=512, L=16, B=128, H=512, Sc=128, P=3, X=8, R=3, causal=False):
     ), model_config)
 
 
-def init_dprnn(N=64, L=2, B=128, H=128, R=6, K=250, causal=False):
+def init_dprnn(N=64, L=2, B=128, H=128, R=6, K=250, T='lstm', causal=False):
     model_config = locals()
     return (DPRNNTasNet(
         n_src=1,
@@ -516,6 +517,7 @@ def init_dprnn(N=64, L=2, B=128, H=128, R=6, K=250, causal=False):
         hid_size=H,
         n_repeats=R,
         chunk_size=K,
+        rnn_type=T,
         bidirectional=(not causal)
     ), model_config)
 
@@ -535,11 +537,12 @@ def init_dpt(N=64, L=2, H=256, R=6, K=250, causal=False):
     ), model_config)
 
 
-def init_gru(hidden_size=64, num_layers=2):
+def init_gru(hidden_size=64, num_layers=2, bidirectional=True):
     model_config = locals()
     return (GRUNet(
         hidden_size=hidden_size,
-        num_layers=num_layers
+        num_layers=num_layers,
+        bidirectional=bidirectional
     ), model_config)
 
 
@@ -555,13 +558,14 @@ def init_model(
     model_config: dict = model_config or {}
     if not bool(model_size or model_config):
         raise ValueError('Expected either `model_size` or `model_config`.')
-    if not (model_size in {'small', 'medium', 'large'}):
+    if not (model_size in {'tiny', 'small', 'medium', 'large'}):
         raise ValueError('Size must be either "small", "medium", or "large".')
     if model_name == 'convtasnet':
         if model_config:
             model, model_config = init_ctn(**model_config)
         else:
             model, model_config = init_ctn(**{
+                'tiny': dict(H=32, B=8, X=7, R=2),
                 'small': dict(H=64, B=16, X=7, R=2),
                 'medium': dict(H=128, B=32, X=7, R=2),
                 'large': dict(H=256, B=64, X=7, R=2),
@@ -571,15 +575,30 @@ def init_model(
             model, model_config = init_dprnn(**model_config)
         else:
             model, model_config = init_dprnn(**{
-                'small': dict(B=64, H=64, R=1),
-                'medium': dict(B=64, H=128, R=1),
-                'large': dict(B=128, H=128, R=2)
+                'tiny': dict(H=16, T='gru'),
+                'small': dict(H=32, T='gru'),
+                'medium': dict(H=64, T='gru'),
+                'large': dict(H=128, T='gru')
             }.get(model_size))
+    # def init_dprnn(N=64, L=2, B=128, H=128, R=6, K=250, causal=False):
+    #     model_config = locals()
+    #     return (DPRNNTasNet(
+    #         n_src=1,
+    #         sample_rate=sample_rate,
+    #         n_filters=N,
+    #         kernel_size=L,
+    #         bn_chan=B,
+    #         hid_size=H,
+    #         n_repeats=R,
+    #         chunk_size=K,
+    #         bidirectional=(not causal)
+    #     ), model_config)
     elif model_name == 'dptnet':
         if model_config:
             model, model_config = init_dpt(**model_config)
         else:
             model, model_config = init_dpt(**{
+                'tiny': dict(R=2, H=18),
                 'small': dict(R=2, H=36),
                 'medium': dict(R=2, H=72),
                 'large': dict(R=2, H=144)
@@ -589,6 +608,7 @@ def init_model(
             model, model_config = init_gru(**model_config)
         else:
             model, model_config = init_gru(**{
+                'tiny': dict(hidden_size=32, num_layers=2),
                 'small': dict(hidden_size=64, num_layers=2),
                 'medium': dict(hidden_size=128, num_layers=2),
                 'large': dict(hidden_size=256, num_layers=2)
@@ -600,6 +620,54 @@ def init_model(
     return model, model_nparams, model_config
 
 
+def load_checkpoint(
+        path: Union[str, os.PathLike]
+) -> (torch.nn.Module, dict):
+
+    input_path = pathlib.Path(path)
+
+    # If the path suffix is the PyTorch file extension,
+    # then it's already a checkpoint
+    if input_path.is_file() and input_path.suffix == '.pt':
+        checkpoint_path = str(input_path)
+
+    # If it's a directory, get the latest checkpoint
+    # from that folder.
+    elif input_path.is_dir():
+        try:
+            m = {
+                input_path.joinpath('ckpt_best.pt'),
+                input_path.joinpath('ckpt_last.pt')
+            }
+            checkpoints = set(input_path.glob('*.pt'))
+            if m.issubset(checkpoints):
+                checkpoints.remove(input_path.joinpath('ckpt_last.pt'))
+            checkpoint_path = str(max(checkpoints, key=os.path.getctime))
+        except ValueError:
+            raise IOError(f'Input directory {str(input_path)} does not contain '
+                          f'checkpoints.')
+    else:
+        raise IOError(f'{str(input_path)} is not a checkpoint or directory.')
+
+    # Get the appropriate config file.
+    config_path = pathlib.Path(checkpoint_path).with_name('config.json')
+    if not config_path.is_file():
+        raise IOError(f'Missing config file at {str(input_path)}.')
+
+    # Load the config file.
+    with open(config_path, 'r') as fp:
+        config: dict = json.load(fp)
+
+    # Initialize the model
+    model = init_model(model_name=config.get('model_name'),
+                       model_size=config.get('model_size'))[0]
+    ckpt = torch.load(checkpoint_path)
+    model.load_state_dict(ckpt.get('model_state_dict'), strict=True)
+    # model.cuda()
+
+    return model, config
+
+
 def count_parameters(network: torch.nn.Module):
     return sum(p.numel() for p in network.parameters() if p.requires_grad)
 
@@ -608,8 +676,9 @@ def count_parameters(network: torch.nn.Module):
 def test_denoiser_from_module(
         model: torch.nn.Module,
         data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
-        accumulation: bool = False
-):
+        accumulation: bool = False,
+        return_mean: bool = False
+) -> dict:
     """Evaluates speech enhancement model using provided dataset.
     """
     if not isinstance(data_te, (list, tuple)):
@@ -621,9 +690,10 @@ def test_denoiser_from_module(
         value = feedforward(batch.inputs, batch.targets,
                             model, None, accumulation, test=True)[1]
         results[key] = value
-    num_tests = len(list(results.keys()))
-    if num_tests > 1:
-        results['mean']: float = sum(list(results.values())) / num_tests
+    if return_mean:
+        num_tests = len(list(results.keys()))
+        if num_tests > 1:
+            results['mean']: float = sum(list(results.values())) / num_tests
     return results
 
 
@@ -632,7 +702,7 @@ def test_denoiser_from_file(
         checkpoint_path: Union[str, os.PathLike],
         data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
         accumulation: bool = False
-):
+) -> Tuple[dict, int]:
     """Evaluates speech enhancement model checkpoint using provided dataset.
     """
     # load a config yaml file which should be in the same location
@@ -646,15 +716,11 @@ def test_denoiser_from_file(
                        model_size=config.get('model_size'))[0]
     ckpt = torch.load(checkpoint_path)
     num_examples = ckpt.get('num_examples')
-    suffix = ''
-    if str(num_examples) not in str(checkpoint_path):
-        suffix = ' ({})'.format(ckpt.get('num_examples'))
     model.load_state_dict(ckpt.get('model_state_dict'), strict=True)
     model.cuda()
 
-    print(f'Using {checkpoint_path}{suffix} ...')
-
-    return test_denoiser_from_module(model, data_te, accumulation)
+    return (test_denoiser_from_module(model, data_te, accumulation),
+            num_examples)
 
 
 @torch.no_grad()

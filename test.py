@@ -1,55 +1,84 @@
+import collections
+import json
+import pathlib
+
+import ast
+
 from exp_models import test_denoiser
 from exp_data import Mixtures, data_te_specialist
 from time import sleep
-import json
 import re
 import sys
 
 if len(sys.argv) > 1:
     folders = sys.argv[1:]
 else:
-    folders = [
-        '/N/u/asivara/2022-jstsp/sisdri/Dec10_17-36-37_grunet_large_np_nc_sp019/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec10_20-28-03_grunet_large_np_nc_sp026/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec10_22-40-20_grunet_large_np_nc_sp039/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec11_01-15-09_grunet_large_np_nc_sp040/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec11_04-43-46_grunet_large_np_nc_sp078/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec11_06-56-10_grunet_large_np_nc_sp083/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec11_09-03-00_grunet_large_np_nc_sp087/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec11_12-01-13_grunet_large_np_nc_sp089/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec11_14-14-46_grunet_large_np_nc_sp118/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec11_16-27-07_grunet_large_np_nc_sp125/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec11_19-03-54_grunet_large_np_nc_sp163/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec11_21-17-38_grunet_large_np_nc_sp196/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec12_00-00-07_grunet_large_np_nc_sp198/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec12_04-53-35_grunet_large_np_nc_sp200/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec12_07-35-00_grunet_large_np_nc_sp201/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec12_11-12-36_grunet_large_np_nc_sp250/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec12_14-24-35_grunet_large_np_nc_sp254/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec12_16-37-05_grunet_large_np_nc_sp307/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec12_20-13-38_grunet_large_np_nc_sp405/early_stopping.txt',
-        '/N/u/asivara/2022-jstsp/sisdri/Dec12_22-23-18_grunet_large_np_nc_sp446/early_stopping.txt',
-    ]
+    raise ValueError('Expected subsequent arguments to be checkpoint paths '  
+                     'or directory.')
+
+class Row(collections.namedtuple(
+    'Row',
+    ['checkpoint_path', 'test_sisdri', 'model_name', 'model_size',
+     'is_generalist', 'speaker_id', 'loss_contrastive', 'loss_purification',
+     'finetune_duration', 'num_examples']
+)):
+    def __repr__(self):
+        return (f'{self.checkpoint_path},'
+                f'{float(self.test_sisdri)},'
+                f'{self.model_name},'
+                f'{self.model_size},'
+                f'{int(self.is_generalist)},'
+                f'{self.speaker_id},'
+                f'{int(self.loss_contrastive)},'
+                f'{int(self.loss_purification)},'
+                f'{int(self.finetune_duration)},'
+                f'{int(self.num_examples)}')
+
+
+# print csv header row
+print(','.join(Row._fields))
 
 for f in folders:
     try:
         path = f.strip()
         path = path.replace('early_stopping.txt', '')
-        accumulation = bool('tasnet' in f)
-        if '_sp' in f:
-            sp_id = int(re.match(r'.*_sp(\d\d\d).*', f).group(1))
+        accumulation = not bool('grunet' in f)
+        checkpoint_path = pathlib.Path(path)
+        if checkpoint_path.is_file():
+            config_file = checkpoint_path.with_name('config.json')
+        else:
+            config_file = checkpoint_path.joinpath('config.json')
+        if not config_file.exists():
+            raise ValueError(f'Could not find {str(config_file)}.')
+        with open(config_file, 'r') as fp:
+            config: dict = json.load(fp)
+        sp_id = ''
+        try:
+            sp_id = int(re.match(r'.*_(sp|ge)(\d\d\d).*', f).group(2))
             dataset = Mixtures(
                 sp_id, 'test', split_mixture='test', snr_mixture=(-5,5))
-            result = test_denoiser(path,
-                                   data_te=dataset,
-                                   accumulation=accumulation,
-                                   use_last=False)
-        else:
-            result = test_denoiser(path,
-                                   data_te=data_te_specialist,
-                                   accumulation=accumulation,
-                                   use_last=False)
-        print(json.dumps(result, indent=1))
+            results, num_examples = test_denoiser(
+                path, data_te=dataset, accumulation=accumulation,
+                use_last=False)
+        except AttributeError:
+            results, num_examples = test_denoiser(
+                path, data_te=data_te_specialist, accumulation=accumulation,
+                use_last=False)
+        for k, v in results.items():
+            if isinstance(ast.literal_eval(k), list):
+                k = ast.literal_eval(k).pop()
+            print(Row(
+                checkpoint_path=checkpoint_path,
+                test_sisdri=v,
+                model_name=config['model_name'],
+                model_size=config['model_size'],
+                is_generalist=not ('_sp' in f),
+                speaker_id=k,
+                loss_contrastive=int(config['use_loss_contrastive']),
+                loss_purification=int(config['use_loss_purification']),
+                finetune_duration=config.get('dataset_duration', 0),
+                num_examples=num_examples
+            ))
     except RuntimeError as e:
         if 'state_dict' in str(e):
             print(f'Skipping {f} due to mismatched model.')

@@ -7,6 +7,7 @@ import json
 import librosa
 import numpy as np
 import pandas as pd
+import socket
 import soundfile as sf
 import torch
 from asteroid.losses.sdr import singlesrc_neg_sisdr
@@ -20,12 +21,18 @@ example_duration: float = 4
 sample_rate: int = 16000
 example_length: int = int(sample_rate * example_duration)
 
-_root_librispeech: str = '/data/asivara/librispeech/'
-_root_demand: str = '/data/asivara/demand/'
-_root_fsd50k: str = '/data/asivara/fsd50k_16khz/'
-_root_musan: str = '/data/asivara/musan/'
-_root_irsurvey: str = '/data/asivara/ir_survey_16khz/'
-_root_slr28: str = '/data/asivara/RIRS_NOISES/'
+_host = str(socket.gethostname().split('.')[-3:].pop(0))
+_root_data: str = dict(
+    transformer='/data/asivara/',
+    juliet='/N/u/asivara/datasets/',
+    gan='/media/sdb1/Data/'
+).get(_host)
+_root_librispeech: str = _root_data + '/librispeech/'
+_root_demand: str = _root_data + '/demand/'
+_root_fsd50k: str = _root_data + '/fsd50k_16khz/'
+_root_musan: str = _root_data + '/musan/'
+_root_irsurvey: str = _root_data + '/ir_survey_16khz/'
+_root_slr28: str = _root_data + '/RIRS_NOISES/'
 
 _eps: float = 1e-8
 _rng = np.random.default_rng(0)
@@ -422,7 +429,6 @@ def dataframe_demand(
 
 def dataframe_fsd50k(
         dataset_directory: Union[str, os.PathLike] = _root_fsd50k,
-        empty: bool = False,
 ) -> pd.DataFrame:
     """Creates a Pandas DataFrame with files from the FSD50K corpus.
     Root directory should mimic archive-extracted folder structure.
@@ -485,7 +491,7 @@ def dataframe_fsd50k(
         raise ValueError(f'Audio files missing, check {dataset_directory}.')
 
     # reindex and name the dataframe
-    df = df[['filepath', 'split', 'duration', 'sparsity']]
+    df = df[['filepath', 'split', 'duration', 'labels', 'sparsity']]
     df = df.reset_index(drop=True)
     df.index.name = 'FSD50K'
     return df
@@ -493,7 +499,6 @@ def dataframe_fsd50k(
 
 def dataframe_musan(
         dataset_directory: Union[str, os.PathLike] = _root_musan,
-        empty: bool = False,
 ) -> pd.DataFrame:
     """Creates a Pandas DataFrame with files from the MUSAN corpus.
     Root directory should mimic archive-extracted folder structure.
@@ -719,11 +724,12 @@ class Mixtures:
             split_premixture: Optional[str] = 'train',
             split_mixture: Optional[str] = 'train',
             split_reverb: Optional[str] = None,
+            frac_speech: Optional[float] = 1.,
             corpus_premixture: str = 'fsd50k',
             corpus_mixture: str = 'musan',
             snr_premixture: Optional[Union[float, Tuple[float, float]]] = None,
             snr_mixture: Optional[Union[float, Tuple[float, float]]] = None,
-            dataset_duration: int = 0
+            dataset_duration: Union[int, float] = 0
     ):
         # verify speaker ID(s)
         if isinstance(speaker_id_or_ids, int):
@@ -735,6 +741,7 @@ class Mixtures:
         if not set(speaker_id_or_ids).issubset(set(speaker_ids_all)):
             raise ValueError('Invalid speaker IDs, not found in LibriSpeech.')
         self.speaker_ids = speaker_id_or_ids
+        self.frac_speech = frac_speech
         self.speaker_ids_repr = repr(self.speaker_ids)
         if set(self.speaker_ids) == set(speaker_ids_tr):
             self.speaker_ids_repr = 'speaker_ids_tr'
@@ -819,6 +826,10 @@ class Mixtures:
         if self.split_speech != 'all':
             self.corpus_s = self.corpus_s.query(
                 f'split == "{self.split_speech}"')
+        if 0 < self.frac_speech < 1:
+            self.corpus_s = self.corpus_s.sample(
+                frac=frac_speech, random_state=0)
+            print('Length of subsampled dataset:', len(self.corpus_s))
         self.corpus_m = get_noise_corpus(corpus_premixture).query(
             f'split == "{self.split_premixture}"')
         self.corpus_n = get_noise_corpus(corpus_mixture).query(
@@ -941,10 +952,10 @@ class Mixtures:
 
         scale_factor = float(np.abs(x).max() + _eps)
         return Batch(
-            inputs=torch.FloatTensor(x) / scale_factor,  # mixture signal
-            targets=torch.FloatTensor(p) / scale_factor,  # premixture signal
-            pre_snrs=torch.FloatTensor(pre_snrs),
-            post_snrs=torch.FloatTensor(post_snrs)
+            inputs=torch.cuda.FloatTensor(x) / scale_factor,
+            targets=torch.cuda.FloatTensor(p) / scale_factor,
+            pre_snrs=torch.cuda.FloatTensor(pre_snrs),
+            post_snrs=torch.cuda.FloatTensor(post_snrs)
         )
 
 
@@ -1068,13 +1079,13 @@ class ContrastiveMixtures(Mixtures):
         scale_factor_2 = float(np.abs(bx_2).max() + _eps)
         scale_factor = max([scale_factor_1, scale_factor_2])
         return ContrastiveBatch(
-            inputs_1=torch.FloatTensor(bx_1) / scale_factor,
-            inputs_2=torch.FloatTensor(bx_2) / scale_factor,
-            targets_1=torch.FloatTensor(bp_1) / scale_factor,
-            targets_2=torch.FloatTensor(bp_2) / scale_factor,
-            labels=torch.BoolTensor(labels),
-            pre_snrs=torch.FloatTensor(bpre_snrs),
-            post_snrs=torch.FloatTensor(bpost_snrs)
+            inputs_1=torch.cuda.FloatTensor(bx_1) / scale_factor,
+            inputs_2=torch.cuda.FloatTensor(bx_2) / scale_factor,
+            targets_1=torch.cuda.FloatTensor(bp_1) / scale_factor,
+            targets_2=torch.cuda.FloatTensor(bp_2) / scale_factor,
+            labels=torch.cuda.BoolTensor(labels),
+            pre_snrs=torch.cuda.FloatTensor(bpre_snrs),
+            post_snrs=torch.cuda.FloatTensor(bpost_snrs)
         )
 
 
@@ -1095,6 +1106,7 @@ data_te_generalist: Mixtures = Mixtures(
     speaker_ids_te, 'test', split_mixture='test', snr_mixture=(-5, 5)
 )
 data_te_specialist: List[Mixtures] = [
-    Mixtures(speaker_id, 'test', split_mixture='test', snr_mixture=(-5, 5))
+    Mixtures(speaker_id, 'test', corpus_mixture='fsd50k',
+             split_mixture='test', snr_mixture=(-5, 5))
     for speaker_id in speaker_ids_te
 ]
