@@ -18,13 +18,13 @@ else:
 
 class Row(collections.namedtuple(
     'Row',
-    ['checkpoint_path', 'test_sisdri', 'model_name', 'model_size',
+    ['checkpoint_path', 'test_metrics', 'model_name', 'model_size',
      'is_generalist', 'speaker_id', 'loss_contrastive', 'loss_purification',
      'finetune_duration', 'num_examples']
 )):
     def __repr__(self):
         return (f'{self.checkpoint_path},'
-                f'{float(self.test_sisdri)},'
+                f'{self.test_metrics},'
                 f'{self.model_name},'
                 f'{self.model_size},'
                 f'{int(self.is_generalist)},'
@@ -67,18 +67,19 @@ for f in folders:
         for k, v in results.items():
             if isinstance(ast.literal_eval(k), list):
                 k = ast.literal_eval(k).pop()
-            print(Row(
-                checkpoint_path=checkpoint_path,
-                test_sisdri=v,
-                model_name=config['model_name'],
-                model_size=config['model_size'],
-                is_generalist=not ('_sp' in f),
-                speaker_id=k,
-                loss_contrastive=int(config['use_loss_contrastive']),
-                loss_purification=int(config['use_loss_purification']),
-                finetune_duration=config.get('dataset_duration', 0),
-                num_examples=num_examples
-            ))
+            # print(Row(
+            #     checkpoint_path=checkpoint_path,
+            #     test_metrics=v,
+            #     model_name=config['model_name'],
+            #     model_size=config['model_size'],
+            #     is_generalist=not ('_sp' in f),
+            #     speaker_id=k,
+            #     loss_contrastive=int(config['use_loss_contrastive']),
+            #     loss_purification=int(config['use_loss_purification']),
+            #     finetune_duration=config.get('dataset_duration', 0),
+            #     num_examples=num_examples
+            # ))
+            print(f'{checkpoint_path} ({num_examples}),{v}')
     except RuntimeError as e:
         if 'state_dict' in str(e):
             print(f'Skipping {f} due to mismatched model.')
