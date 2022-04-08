@@ -1,3 +1,7 @@
+## subdirectories
+notebooks/*
+notebooks/figures/
+
 
 # Created by https://www.toptal.com/developers/gitignore/api/audio,python,pycharm+all,jupyternotebooks,windows,macos,vim,visualstudio
 # Edit at https://www.toptal.com/developers/gitignore?templates=audio,python,pycharm+all,jupyternotebooks,windows,macos,vim,visualstudio
