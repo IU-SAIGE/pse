@@ -2,17 +2,19 @@ import json
 import os
 import pathlib
 from contextlib import suppress
-from typing import Optional, Union, Sequence
-from typing import Tuple
+from typing import Any, Optional, Union, Sequence, Tuple, Dict, Callable
 
 import asteroid.models
+from pesq import pesq
+from pystoi import stoi
 import torch
 import torch.nn.functional as tf
 from torch.nn.modules.loss import _Loss
 
 from exp_data import Mixtures, sample_rate, sisdr_improvement, \
-    data_te_generalist
+    data_te_generalist, sdr, sisdr
 from exp_utils import make_2d, make_3d, pad_x_to_y, shape_reconstructed
+
 
 _fft_size: int = 1024
 _hop_size: int = 256
@@ -288,17 +290,26 @@ def feedforward(
         inputs: torch.Tensor,
         targets: torch.Tensor,
         model: torch.nn.Module,
+        loss_reg: Callable,
+        loss_segm: Callable,
         weights: Optional[torch.Tensor] = None,
         accumulation: bool = False,
         test: bool = False
-) -> Tuple[torch.Tensor, float]:
+) -> Dict[str, float]:
     """Runs a feedforward pass through a model by unraveling batched data.
     """
     batch_size = inputs.shape[0]
     validation = not bool(model.training)
     context = torch.no_grad() if (validation or test) else suppress()
-    sisdri = 0
-    loss_tensor = torch.Tensor(0)
+    r_sisdr_inp: float = 0
+    r_sisdr_enh: float = 0
+    r_sdr_inp: float = 0
+    r_sdr_enh: float = 0
+    r_pesq_inp: float = 0
+    r_pesq_enh: float = 0
+    r_stoi_inp: float = 0
+    r_stoi_enh: float = 0
+    r_loss: float = 0
 
     with context:
         if accumulation:
@@ -316,18 +327,39 @@ def feedforward(
                     if weights is not None:
                         w = weights[i].unsqueeze(0)
                         loss_tensor = torch.mean(
-                            loss_wmse(y, t, w))
+                            loss_segm(y, t, w))
                     else:
                         loss_tensor = torch.mean(
-                            loss_mse(y, t))
+                            loss_reg(y, t))
+                    loss_tensor /= batch_size
+                    r_loss += float(loss_tensor)
                 if not (validation or test):
                     loss_tensor.backward()
 
-                # calculate signal improvement
-                sisdri += float(torch.mean(
-                    sisdr_improvement(y, t, x)))
+                # compute PESQ and STOI (perceptual scores) only during testing
+                if test:
+                    _x = x.detach().cpu().numpy().squeeze()
+                    _y = y.detach().cpu().numpy().squeeze()
+                    _t = t.detach().cpu().numpy().squeeze()
+                    r_pesq_inp += pesq(sample_rate, _t, _x, 'wb')
+                    r_pesq_enh += pesq(sample_rate, _t, _y, 'wb')
+                    r_stoi_inp += stoi(_t, _x, sample_rate, True)
+                    r_stoi_enh += stoi(_t, _y, sample_rate, True)
 
-            sisdri /= batch_size
+                # calculate signal improvement
+                r_sdr_inp += float(sdr(x, t, reduction='mean'))
+                r_sdr_enh += float(sdr(y, t, reduction='mean'))
+                r_sisdr_inp += float(sisdr(x, t, reduction='mean'))
+                r_sisdr_enh += float(sisdr(y, t, reduction='mean'))
+
+            r_sdr_inp /= batch_size
+            r_sdr_enh /= batch_size
+            r_sisdr_inp /= batch_size
+            r_sisdr_enh /= batch_size
+            r_pesq_inp /= batch_size
+            r_pesq_enh /= batch_size
+            r_stoi_inp /= batch_size
+            r_stoi_enh /= batch_size
 
         else:
 
@@ -339,20 +371,48 @@ def feedforward(
             if not test:
                 if weights is not None:
                     loss_tensor = torch.mean(
-                        loss_wmse(estimates, targets, weights))
+                        loss_segm(estimates, targets, weights))
                 else:
                     loss_tensor = torch.mean(
-                        loss_mse(estimates, targets))
+                        loss_reg(estimates, targets))
+                r_loss = float(loss_tensor)
 
             # backwards pass
             if not (validation or test):
                 loss_tensor.backward()
 
-            # calculate signal improvement
-            sisdri = float(torch.mean(
-                sisdr_improvement(estimates, targets, inputs)))
+            # compute PESQ and STOI (perceptual scores) only during testing
+            if test:
+                _x = inputs.detach().cpu().numpy().squeeze()
+                _y = estimates.detach().cpu().numpy().squeeze()
+                _t = targets.detach().cpu().numpy().squeeze()
+                for i in range(batch_size):
+                    r_pesq_inp += pesq(sample_rate, _t[i], _x[i], 'wb')
+                    r_pesq_enh += pesq(sample_rate, _t[i], _y[i], 'wb')
+                    r_stoi_inp += stoi(_t[i], _x[i], sample_rate, True)
+                    r_stoi_enh += stoi(_t[i], _y[i], sample_rate, True)
+                r_pesq_inp /= batch_size
+                r_pesq_enh /= batch_size
+                r_stoi_inp /= batch_size
+                r_stoi_enh /= batch_size
 
-    return loss_tensor, sisdri
+            # calculate signal improvement
+            r_sdr_inp = float(sdr(inputs, targets, reduction='mean'))
+            r_sdr_enh = float(sdr(estimates, targets, reduction='mean'))
+            r_sisdr_inp = float(sisdr(inputs, targets, reduction='mean'))
+            r_sisdr_enh = float(sisdr(estimates, targets, reduction='mean'))
+
+    return dict(loss=r_loss,
+                sdr_inp=r_sdr_inp,
+                sdr_enh=r_sdr_enh,
+                sisdri=(r_sisdr_enh-r_sisdr_inp),
+                sisdr_inp=r_sisdr_inp,
+                sisdr_enh=r_sisdr_enh,
+                pesq_inp=r_pesq_inp,
+                pesq_enh=r_pesq_enh,
+                stoi_inp=r_stoi_inp,
+                stoi_enh=r_stoi_enh,
+    )
 
 
 def contrastive_feedforward(
@@ -361,6 +421,8 @@ def contrastive_feedforward(
         targets_1: torch.Tensor,
         targets_2: torch.Tensor,
         labels: torch.BoolTensor,
+        loss_reg: Callable,
+        loss_segm: Callable,
         lambda_positive: float,
         lambda_negative: float,
         model: torch.nn.Module,
@@ -369,13 +431,17 @@ def contrastive_feedforward(
         accumulation: bool = False,
         validation: bool = False,
         test: bool = False
-) -> Tuple[float, float]:
+) -> Dict[str, float]:
     """Runs a feedforward pass through a model by unraveling batched data.
     """
     labels = labels.bool()
     batch_size = inputs_1.shape[0]
     context = torch.no_grad() if (validation or test) else suppress()
-    sisdri, loss_value = 0, 0
+    r_sisdri: float = 0
+    r_loss: float = 0
+    r_loss_sig: float = 0
+    r_loss_pos: float = 0
+    r_loss_neg: float = 0
     ratio_pos = float(sum(labels) / batch_size)
     ratio_neg = float(sum(~labels) / batch_size)
     use_dp = bool(weights_1 is not None) and bool(weights_2 is not None)
@@ -383,6 +449,8 @@ def contrastive_feedforward(
     with context:
         if accumulation:
             for i in range(batch_size):
+
+                loss_tensor_sig, loss_tensor_pos, loss_tensor_neg = 0, 0, 0
 
                 # unravel batch
                 x_1 = inputs_1[i].unsqueeze(0).cuda()
@@ -406,35 +474,44 @@ def contrastive_feedforward(
                         w_2 = weights_2[i].unsqueeze(0).cuda()
                         w_p = w_1 * w_2
                         w = torch.cat([w_1, w_2], dim=0)
-                        loss_tensor = torch.mean(loss_wmse(y, t, w))
+                        loss_tensor_sig = torch.mean(loss_segm(y, t, w))
                         if labels[i]:
-                            loss_tensor += lambda_positive * torch.mean(
-                                loss_wmse(y_1, y_2, w_1))
+                            loss_tensor_pos = lambda_positive * torch.mean(
+                                loss_segm(y_1, y_2, w_1))
                         else:
-                            loss_tensor += lambda_negative * torch.mean(
-                                torch.pow(loss_wmse(y_1, y_2, w_p) -
-                                          loss_wmse(t_1, t_2, w_p), 2))
+                            loss_tensor_neg = lambda_negative * torch.mean(
+                                torch.pow(loss_segm(y_1, y_2, w_p) -
+                                          loss_segm(t_1, t_2, w_p), 2))
                     else:
-                        loss_tensor = torch.mean(loss_mse(y, t))
+                        loss_tensor_sig = torch.mean(loss_reg(y, t))
                         if labels[i]:
-                            loss_tensor += lambda_positive * torch.mean(
-                                loss_mse(y_1, y_2))
+                            loss_tensor_pos = lambda_positive * torch.mean(
+                                loss_reg(y_1, y_2))
                         else:
-                            loss_tensor += lambda_negative * torch.mean(
-                                torch.pow(loss_mse(y_1, y_2) -
-                                          loss_mse(t_1, t_2), 2))
-                    loss_value += float(loss_tensor)
+                            loss_tensor_neg = lambda_negative * torch.mean(
+                                torch.pow(loss_reg(y_1, y_2) -
+                                          loss_reg(t_1, t_2), 2))
+
+                    loss_tensor_sig /= batch_size
+                    loss_tensor_pos /= (batch_size/2)
+                    loss_tensor_neg /= (batch_size/2)
+                    r_loss += float(loss_tensor_sig + loss_tensor_pos +
+                        loss_tensor_neg)
+                    r_loss_sig += float(loss_tensor_sig)
+                    r_loss_pos += float(loss_tensor_pos)
+                    r_loss_neg += float(loss_tensor_neg)
 
                     # backwards pass
                     if not validation:
-                        loss_tensor.backward()
+                        (loss_tensor_sig + loss_tensor_pos +
+                         loss_tensor_neg).backward()
 
                 # calculate signal improvement
-                sisdri += float(sisdr_improvement(y, t, x, 'mean'))
+                r_sisdri += float(sisdr_improvement(y, t, x, 'mean'))
 
-            sisdri /= batch_size
-            loss_value /= batch_size
+            r_sisdri /= batch_size
 
+        # TODO: copy logic from gradient accumulated version down here
         else:
 
             # unravel batch
@@ -460,33 +537,37 @@ def contrastive_feedforward(
                     w_2 = weights_2.cuda()
                     w_p = w_1 * w_2
                     w = torch.cat([w_1, w_2], dim=0)
-                    loss_tensor = torch.mean(loss_wmse(y, t, w))
+                    loss_tensor = torch.mean(loss_segm(y, t, w))
                     if ratio_pos:
                         loss_tensor += lambda_positive * ratio_pos * torch.mean(
-                            loss_wmse(y_1[l], y_2[l], w_1[l]))
+                            loss_segm(y_1[l], y_2[l], w_1[l]))
                     if ratio_neg:
                         loss_tensor += lambda_negative * ratio_neg * torch.mean(
-                            torch.pow(loss_wmse(t_1[~l], t_2[~l], w_p[~l]) -
-                                      loss_wmse(y_1[~l], y_2[~l], w_p[~l]), 2))
+                            torch.pow(loss_segm(t_1[~l], t_2[~l], w_p[~l]) -
+                                      loss_segm(y_1[~l], y_2[~l], w_p[~l]), 2))
                 else:
-                    loss_tensor = torch.mean(loss_mse(y, t))
+                    loss_tensor = torch.mean(loss_reg(y, t))
                     if ratio_pos:
                         loss_tensor += lambda_positive * ratio_pos * torch.mean(
-                            loss_mse(y_1[l], y_2[l]))
+                            loss_reg(y_1[l], y_2[l]))
                     if ratio_neg:
                         loss_tensor += lambda_negative * ratio_neg * torch.mean(
-                            torch.pow(loss_mse(t_1[~l], t_2[~l]) -
-                                      loss_mse(y_1[~l], y_2[~l]), 2))
-                loss_value += float(loss_tensor)
+                            torch.pow(loss_reg(t_1[~l], t_2[~l]) -
+                                      loss_reg(y_1[~l], y_2[~l]), 2))
+                r_loss = float(loss_tensor)
 
                 # backwards pass
                 if not validation:
                     loss_tensor.backward()
 
             # calculate signal improvement
-            sisdri += float(sisdr_improvement(y, t, x, 'mean'))
+            r_sisdri += float(sisdr_improvement(y, t, x, 'mean'))
 
-    return loss_value, sisdri
+    return dict(loss=r_loss,
+                loss_sig=r_loss_sig,
+                loss_pos=r_loss_pos,
+                loss_neg=r_loss_neg,
+                sisdri=r_sisdri)
 
 
 def init_ctn(N=512, L=16, B=128, H=512, Sc=128, P=3, X=8, R=3, causal=False):
@@ -668,7 +749,7 @@ def load_checkpoint(
     return model, config
 
 
-def count_parameters(network: torch.nn.Module):
+def count_parameters(network: Any) -> int:
     return sum(p.numel() for p in network.parameters() if p.requires_grad)
 
 
@@ -676,24 +757,22 @@ def count_parameters(network: torch.nn.Module):
 def test_denoiser_from_module(
         model: torch.nn.Module,
         data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
-        accumulation: bool = False,
-        return_mean: bool = False
+        accumulation: bool = False
 ) -> dict:
     """Evaluates speech enhancement model using provided dataset.
     """
+    no_op_loss = lambda *a, **k: 0
     if not isinstance(data_te, (list, tuple)):
         data_te = [data_te]
     results = {}
     for dataset in data_te:
         batch = dataset(100, seed=0)
         key = dataset.speaker_ids_repr
-        value = feedforward(batch.inputs, batch.targets,
-                            model, None, accumulation, test=True)[1]
-        results[key] = value
-    if return_mean:
-        num_tests = len(list(results.keys()))
-        if num_tests > 1:
-            results['mean']: float = sum(list(results.values())) / num_tests
+        results[key] = feedforward(
+            batch.inputs, batch.targets,
+            model, weights=None, accumulation=accumulation, test=True,
+            loss_reg=no_op_loss, loss_segm=no_op_loss
+        )
     return results
 
 
@@ -777,7 +856,3 @@ def test_denoiser(
             raise ValueError(f'{str(path)} does not exist.')
     else:
         raise ValueError('Expected input to be PyTorch model or filepath.')
-
-
-loss_mse = torch.nn.MSELoss(reduction='none')
-loss_wmse = SegmentalLoss('mse', reduction='none')
