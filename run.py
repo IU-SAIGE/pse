@@ -6,12 +6,14 @@ import os
 import socket
 import sys
 import warnings
+from ast import literal_eval
 from datetime import datetime
 from math import ceil
 from pathlib import Path
 from typing import Optional, List, Sequence
 from typing import Union
 
+import asteroid.losses
 import numpy as np
 import torch
 import yaml
@@ -20,11 +22,13 @@ from torch.utils.tensorboard import SummaryWriter
 from exp_data import ContrastiveMixtures, Mixtures
 from exp_data import example_duration, sample_rate
 from exp_data import speaker_ids_tr, speaker_ids_vl, speaker_ids_te
-from exp_models import SNRPredictor, init_model, load_checkpoint
+from exp_models import SegmentalLoss, SNRPredictor, init_model, load_checkpoint
 from exp_models import contrastive_feedforward, feedforward
 from exp_utils import EarlyStopping, ExperimentError
 
 warnings.filterwarnings('ignore')
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 
 _host = str(socket.gethostname().split('.')[-3:].pop(0))
 
@@ -56,7 +60,8 @@ def train_denoiser(
         num_examples_earlystopping: int = 100000,
         trial_name: Optional[str] = None,
         output_folder: Union[str, os.PathLike] = f'trials_{_host}',
-        training_metric: str = 'sisdri'
+        early_stopping_metric: str = 'sisdri',
+        distance_func: str = 'mse'
 ) -> str:
     # prepare model, optimizer, and loss function
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
@@ -98,6 +103,7 @@ def train_denoiser(
         'checkpoint_path': str(checkpoint_path or ''),
         'data_tr': data_tr.__dict__(),
         'data_vl': data_vl.__dict__(),
+        'distance_func': distance_func,
         'example_duration': example_duration,
         'lambda_p': lambda_p,
         'lambda_n': lambda_n,
@@ -113,7 +119,7 @@ def train_denoiser(
         'speaker_ids': data_tr.speaker_ids_repr,
         'use_loss_contrastive': use_loss_contrastive,
         'use_loss_purification': use_loss_purification,
-        'training_metric': training_metric,
+        'early_stopping_metric': early_stopping_metric,
         'is_finetuning': is_finetuning
     }
 
@@ -127,10 +133,21 @@ def train_denoiser(
     # begin training (use gradient accumulation for TasNet models)
     num_examples: int = init_num_examples
     num_validations: int = ceil(num_examples / num_examples_validation)
-    best_score: float = np.inf * (1 if training_metric == 'mse' else -1)
+    best_score: float = np.inf * (1 if early_stopping_metric == 'mse' else -1)
     best_score_step: int = init_num_examples
     use_gradient_accumulation: bool = not bool('grunet' in model_name)
     print(f'Output Directory: {str(output_directory)}')
+
+    # define the distance function
+    if distance_func == 'snr':
+        distfunc_reg = asteroid.losses.sdr.SingleSrcNegSDR('snr')
+        distfunc_segm = SegmentalLoss('snr', reduction='none')
+    elif distance_func == 'sisdr':
+        distfunc_reg = asteroid.losses.sdr.SingleSrcNegSDR('sisdr')
+        distfunc_segm = SegmentalLoss('sisdr', reduction='none')
+    else:
+        distfunc_reg = torch.nn.MSELoss(reduction='none')
+        distfunc_segm = SegmentalLoss('mse', reduction='none')
 
     try:
         for num_examples in itertools.count(start=init_num_examples,
@@ -150,11 +167,12 @@ def train_denoiser(
                 w_2 = predictor(p_2) if use_loss_purification else None
 
                 # forward propagation
-                loss_tr, sisdri_tr = contrastive_feedforward(
+                metrics_tr = contrastive_feedforward(
                     inputs_1=x_1, inputs_2=x_2,
                     targets_1=p_1, targets_2=p_2,
                     weights_1=w_1, weights_2=w_2,
-                    lambda_positive=1., lambda_negative=1.,
+                    lambda_positive=lambda_p, lambda_negative=lambda_n,
+                    loss_reg=distfunc_reg, loss_segm=distfunc_segm,
                     labels=batch.labels.cuda(),
                     model=model.cuda(),
                     accumulation=use_gradient_accumulation,
@@ -171,8 +189,10 @@ def train_denoiser(
                 w = predictor(p) if use_loss_purification else None
 
                 # forward propagation
-                loss_tr, sisdri_tr = feedforward(
-                    x, p, model.train(), w, use_gradient_accumulation)
+                metrics_tr = feedforward(
+                    inputs=x, targets=p, model=model.train(),
+                    loss_reg=distfunc_reg, loss_segm=distfunc_segm,
+                    weights=w, accumulation=use_gradient_accumulation)
 
             # update parameters
             optimizer.step()
@@ -199,11 +219,12 @@ def train_denoiser(
                     w_2 = predictor(p_2) if use_loss_purification else None
 
                     # forward propagation
-                    loss_vl, sisdri_vl = contrastive_feedforward(
+                    metrics_vl = contrastive_feedforward(
                         inputs_1=x_1, inputs_2=x_2,
                         targets_1=p_1, targets_2=p_2,
                         weights_1=w_1, weights_2=w_2,
                         lambda_positive=lambda_p, lambda_negative=lambda_n,
+                        loss_reg=distfunc_reg, loss_segm=distfunc_segm,
                         labels=batch.labels.cuda(),
                         model=model.cuda(),
                         accumulation=use_gradient_accumulation,
@@ -220,30 +241,32 @@ def train_denoiser(
                     w = predictor(p) if use_loss_purification else None
 
                     # forward propagation
-                    loss_vl, sisdri_vl = feedforward(
-                        x, p, model.eval(), w, use_gradient_accumulation)
+                    metrics_vl = feedforward(
+                        inputs=x, targets=p, model=model.eval(),
+                        loss_reg=distfunc_reg, loss_segm=distfunc_segm,
+                        weights=w, accumulation=use_gradient_accumulation)
 
                 # write summaries
-                writer.add_scalar('MSELoss/train',
-                                  float(loss_tr), num_examples)
-                writer.add_scalar('SISDRi/train',
-                                  float(sisdri_tr), num_examples)
-                writer.add_scalar('MSELoss/validation',
-                                  float(loss_vl), num_examples)
-                writer.add_scalar('SISDRi/validation',
-                                  float(sisdri_vl), num_examples)
+                for (k, v) in metrics_tr.items():
+                    if ('_inp' not in k) and ('_enh' not in k):
+                        writer.add_scalar(
+                            f'train/{k}', float(v), num_examples)
+                for (k, v) in metrics_vl.items():
+                    if ('_inp' not in k) and ('_enh' not in k):
+                        writer.add_scalar(
+                            f'validation/{k}', float(v), num_examples)
 
                 # checkpoint whenever validation score improves
-                if training_metric == 'mse':
-                    save_ckpt = bool(float(loss_vl)<=best_score)
+                if early_stopping_metric == 'mse':
+                    save_ckpt = bool(metrics_vl['loss']<=best_score)
                 else:
-                    save_ckpt = bool(float(sisdri_vl)>=best_score)
+                    save_ckpt = bool(metrics_vl['sisdri']>=best_score)
 
                 if save_ckpt:
                     best_score = {
-                        'mse': float(loss_vl),
-                        'sisdri': float(sisdri_vl)
-                    }.get(training_metric, 0)
+                        'mse': metrics_vl['loss'],
+                        'sisdri': metrics_vl['sisdri']
+                    }.get(early_stopping_metric, 0)
                     best_score_step = num_examples
                     ckpt_path = output_directory.joinpath('ckpt_best.pt')
                     torch.save({
@@ -254,7 +277,7 @@ def train_denoiser(
                         'optimizer_state_dict': optimizer.state_dict()
                     }, ckpt_path)
                     print(f'Examples: {num_examples:>10},\t'
-                          f'Validation SI-SDRi: {float(sisdri_vl)}')
+                          'Validation SI-SDRi: '+str(metrics_vl['sisdri']))
                     step_path = output_directory.joinpath('best_step.txt')
                     with open(step_path, 'w') as fp:
                         print(num_examples, file=fp)
@@ -273,6 +296,7 @@ def train_denoiser(
     except KeyboardInterrupt:
         print(f'Manually exited at {num_examples} examples; best model saw '
               f'{best_score_step} examples.')
+        sys.exit(-1)
 
     torch.save({
         'num_examples': num_examples,
@@ -342,7 +366,8 @@ def finetune_denoiser(
         num_examples_validation: int = 1000,
         num_examples_earlystopping: int = 10000,
         output_folder: Union[str, os.PathLike] = f'finetuning_{_host}',
-        training_metric: str = 'sisdri'
+        early_stopping_metric: str = 'sisdri',
+        distance_func: str = 'mse'
 ):
     """Finetunes a denoiser, given checkpoint and dataset size.
     """
@@ -363,7 +388,19 @@ def finetune_denoiser(
         config['num_examples_validation'] = num_examples_validation
         config['num_examples_earlystopping'] = num_examples_earlystopping
         config['output_folder'] = output_folder
-        config['training_metric'] = training_metric
+        config['early_stopping_metric'] = early_stopping_metric
+        config['distance_func'] = distance_func
+
+        # define the distance function
+        if distance_func == 'snr':
+            distfunc_reg = asteroid.losses.sdr.SingleSrcNegSDR('snr')
+            distfunc_segm = SegmentalLoss('snr', reduction='none')
+        elif distance_func == 'sisdr':
+            distfunc_reg = asteroid.losses.sdr.SingleSrcNegSDR('sisdr')
+            distfunc_segm = SegmentalLoss('sisdr', reduction='none')
+        else:
+            distfunc_reg = torch.nn.MSELoss(reduction='none')
+            distfunc_segm = SegmentalLoss('mse', reduction='none')
 
         # If this is a generalist, loop through all the personalization targets.
         # Else, if it is a specialist, this loop will only run once.
@@ -406,7 +443,9 @@ def finetune_denoiser(
             # Begin training
             num_examples: int = 0
             num_validations: int = 0
-            best_score: float = np.inf * (1 if training_metric == 'mse' else -1)
+            best_score: float = np.inf * (1 if early_stopping_metric == 'mse'
+                                          else
+                                          -1)
             best_score_step: int = 0
             use_gradient_accumulation: bool = not bool('grunet' in model_name)
             print(f'Output Directory: {str(output_directory)}')
@@ -416,8 +455,9 @@ def finetune_denoiser(
 
                     batch = data_tr(batch_size)
 
-                    loss_tr, sisdri_tr = feedforward(
+                    metrics_tr = feedforward(
                         batch.inputs, batch.targets, model.train(),
+                        loss_reg=distfunc_reg, loss_segm=distfunc_segm,
                         accumulation=use_gradient_accumulation)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -427,29 +467,31 @@ def finetune_denoiser(
 
                     num_validations += 1
                     batch = data_vl(batch_size, seed=0)
-                    loss_vl, sisdri_vl = feedforward(
+                    metrics_vl = feedforward(
                         batch.inputs, batch.targets, model.eval(),
+                        loss_reg=distfunc_reg, loss_segm=distfunc_segm,
                         accumulation=use_gradient_accumulation)
 
-                    writer.add_scalar(
-                        'MSELoss/train', float(loss_tr), num_examples)
-                    writer.add_scalar(
-                        'SISDRi/train', float(sisdri_tr), num_examples)
-                    writer.add_scalar(
-                        'MSELoss/validation', float(loss_vl), num_examples)
-                    writer.add_scalar(
-                        'SISDRi/validation', float(sisdri_vl), num_examples)
+                    # write summaries
+                    for (k, v) in metrics_tr.items():
+                        if ('_inp' not in k) and ('_enh' not in k):
+                            writer.add_scalar(
+                                f'train/{k}', float(v), num_examples)
+                    for (k, v) in metrics_vl.items():
+                        if ('_inp' not in k) and ('_enh' not in k):
+                            writer.add_scalar(
+                                f'validation/{k}', float(v), num_examples)
 
                     do_save_checkpoint = {
-                        'mse': bool(float(loss_vl) <= best_score),
-                        'sisdri': bool(float(sisdri_vl) >= best_score)
-                    }.get(training_metric, False)
+                        'mse': bool(metrics_vl['loss'] <= best_score),
+                        'sisdri': bool(metrics_vl['sisdri'] >= best_score)
+                    }.get(early_stopping_metric, False)
 
                     if do_save_checkpoint:
                         best_score = {
-                            'mse': float(loss_vl),
-                            'sisdri': float(sisdri_vl)
-                        }.get(training_metric, 0)
+                            'mse': metrics_vl['loss'],
+                            'sisdri': metrics_vl['sisdri']
+                        }.get(early_stopping_metric, 0)
                         best_score_step = num_examples
                         ckpt_path = output_directory.joinpath('ckpt_best.pt')
                         torch.save({
@@ -460,7 +502,7 @@ def finetune_denoiser(
                             'optimizer_state_dict': optimizer.state_dict()
                         }, ckpt_path)
                         print(f'Examples: {num_examples:>10},\t'
-                              f'Validation SI-SDRi: {float(sisdri_vl)}')
+                              'Validation SI-SDRi: '+str(metrics_vl['sisdri']))
                         step_path = output_directory.joinpath('best_step.txt')
                         with open(step_path, 'w') as fp:
                             print(num_examples, file=fp)
@@ -490,6 +532,13 @@ def parse_arguments(
     if arg_list is None: arg_list = sys.argv[1:]
     abs_path = lambda p: Path(p).absolute()
 
+    def t_mixture_snr(string):
+        try:
+            return_val = float(string)
+        except ValueError:
+            return_val = literal_eval(string)
+        return return_val
+
     parser = argparse.ArgumentParser()
     parser.add_argument('model_name', type=str)
     parser.add_argument('model_size', type=str,
@@ -502,8 +551,14 @@ def parse_arguments(
     parser.add_argument('--lambda_p', type=float, default=1.)
     parser.add_argument('--lambda_n', type=float, default=1.)
     parser.add_argument('--generalist_frac', type=float, default=1.)
-    parser.add_argument('--training_metric', type=str,
+    parser.add_argument('--distance_func', type=str,
+                        choices={'mse', 'snr', 'sisdr'}, required=True)
+    parser.add_argument('--early_stopping_metric', type=str,
                         choices={'mse', 'sisdri'}, default='sisdri')
+    parser.add_argument("--premixture_snr",
+                        type=t_mixture_snr, default='(0, 15)')
+    parser.add_argument("--mixture_snr",
+                        type=t_mixture_snr, default='(-5, 5)')
     parser.add_argument('--warm_start', type=abs_path)
     parser.add_argument('--trial_suffix', type=str, default='')
     parser.add_argument('--output_folder', type=abs_path,
@@ -542,18 +597,19 @@ def main():
             d_tr = dataset_class(speaker_id,
                                  split_speech='pretrain',
                                  split_premixture='train',
-                                 snr_premixture=(0, 15),
+                                 snr_premixture=args.premixture_snr,
                                  split_mixture='train',
-                                 snr_mixture=(-5, 5))
+                                 snr_mixture=args.mixture_snr)
             d_vl = dataset_class(speaker_id,
                                  split_speech='preval',
                                  split_premixture='val',
-                                 snr_premixture=(0, 15),
+                                 snr_premixture=args.premixture_snr,
                                  split_mixture='val',
-                                 snr_mixture=(-5, 5))
+                                 snr_mixture=args.mixture_snr)
             train_denoiser(
                 model_name=args.model_name,
                 model_size=args.model_size,
+                distance_func=args.distance_func,
                 data_tr=d_tr,
                 data_vl=d_vl,
                 lambda_p=args.lambda_p,
@@ -566,8 +622,8 @@ def main():
                     '_yp' if args.use_loss_purification else '_np',
                     '_yc' if args.use_loss_contrastive else '_nc',
                     speaker_id
-                ),
-                training_metric=args.training_metric,
+                )+args.trial_suffix,
+                early_stopping_metric=args.early_stopping_metric,
                 checkpoint_path=args.warm_start,
                 output_folder=str(args.output_folder)
             )
@@ -578,13 +634,14 @@ def main():
         d_tr = dataset_class(speaker_ids_tr,
                              frac_speech=args.generalist_frac,
                              split_mixture='train',
-                             snr_mixture=(-5, 5))
+                             snr_mixture=args.mixture_snr)
         d_vl = dataset_class(speaker_ids_vl,
                              split_mixture='val',
-                             snr_mixture=(-5, 5))
+                             snr_mixture=args.mixture_snr)
         train_denoiser(
             model_name=args.model_name,
             model_size=args.model_size,
+            distance_func=args.distance_func,
             data_tr=d_tr,
             data_vl=d_vl,
             lambda_p=args.lambda_p,
@@ -594,7 +651,7 @@ def main():
             trial_name='{}_{}'.format(
                 args.model_name, args.model_size
             )+args.trial_suffix,
-            training_metric=args.training_metric,
+            early_stopping_metric=args.early_stopping_metric,
             checkpoint_path=args.warm_start,
             output_folder=str(args.output_folder)
         )
