@@ -7,6 +7,10 @@ class EarlyStopping(Exception):
     pass
 
 
+class SmokeTest(Exception):
+    pass
+
+
 class ExperimentError(Exception):
     pass
 
