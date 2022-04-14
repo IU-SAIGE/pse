@@ -23,10 +23,11 @@ example_length: int = int(sample_rate * example_duration)
 
 _host = str(socket.gethostname().split('.')[-3:].pop(0))
 _root_data: str = dict(
+    audio='/media/sdc1/',
     transformer='/data/asivara/',
     juliet='/N/u/asivara/datasets/',
     gan='/media/sdb1/Data/'
-).get(_host)
+).get(_host, '/N/u/asivara/datasets/')
 _root_librispeech: str = _root_data + '/librispeech/'
 _root_demand: str = _root_data + '/demand/'
 _root_fsd50k: str = _root_data + '/fsd50k_16khz/'
@@ -110,6 +111,14 @@ def wav_read(
     # always pick up the first channel
     y = np.array(y[..., 0])
     return y, float(len(y) / sample_rate)
+
+
+def wav_write(
+        filepath: Union[str, os.PathLike],
+        array: np.ndarray
+):
+    sf.write(filepath, array, samplerate=sample_rate)
+    return
 
 
 def wav_read_multiple(
