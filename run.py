@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import sys
+import time
 import warnings
 from ast import literal_eval
 from datetime import datetime
@@ -17,20 +18,31 @@ import asteroid.losses
 import numpy as np
 import torch
 import yaml
+from pytorch_lightning import seed_everything
+from ray import tune
 from torch.utils.tensorboard import SummaryWriter
 
 from exp_data import ContrastiveMixtures, Mixtures
 from exp_data import example_duration, sample_rate
 from exp_data import speaker_ids_tr, speaker_ids_vl, speaker_ids_te
-from exp_models import SegmentalLoss, SNRPredictor, init_model, load_checkpoint
+from exp_models import SegmentalLoss, SNRPredictor, init_model, load_checkpoint, \
+    test_denoiser_with_speaker
 from exp_models import contrastive_feedforward, feedforward
-from exp_utils import EarlyStopping, ExperimentError
+from exp_utils import EarlyStopping, ExperimentError, SmokeTest
 
 warnings.filterwarnings('ignore')
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 _host = str(socket.gethostname().split('.')[-3:].pop(0))
+_snrp_path = Path(__file__).resolve().parent.joinpath('snr_predictor')
+_tune_kwargs = dict(
+    reuse_actors=True,
+    log_to_file=True,
+    local_dir='.',
+    fail_fast=True,
+    verbose=1
+)
 
 def save_config(
         output_directory: Union[str, os.PathLike],
@@ -44,6 +56,7 @@ def save_config(
         print(yaml.safe_dump(config, default_flow_style=False))
 
 
+# noinspection PyTypeChecker
 def train_denoiser(
         model_name: str,
         model_size: str,
@@ -61,8 +74,13 @@ def train_denoiser(
         trial_name: Optional[str] = None,
         output_folder: Union[str, os.PathLike] = f'trials_{_host}',
         early_stopping_metric: str = 'sisdri',
-        distance_func: str = 'mse'
+        distance_func: str = 'mse',
+        called_by_ray: bool = False,
+        run_smoke_test: bool = False
 ) -> str:
+
+    seed_everything(0)
+
     # prepare model, optimizer, and loss function
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
     model, nparams, model_config = init_model(model_name, model_size)
@@ -71,7 +89,7 @@ def train_denoiser(
     predictor = torch.nn.Identity()
     if use_loss_purification:
         predictor = SNRPredictor()
-        predictor.load_state_dict(torch.load('snr_predictor'), strict=False)
+        predictor.load_state_dict(torch.load(str(_snrp_path)), strict=False)
         predictor.cuda()
         predictor.eval()
 
@@ -124,6 +142,8 @@ def train_denoiser(
     }
 
     # instantiate tensorboard
+    if called_by_ray:
+        trial_name = tune.get_trial_name()
     if output_directory is None:
         output_directory = Path(output_folder).joinpath(
             current_time + '_' + trial_name)
@@ -133,7 +153,7 @@ def train_denoiser(
     # begin training (use gradient accumulation for TasNet models)
     num_examples: int = init_num_examples
     num_validations: int = ceil(num_examples / num_examples_validation)
-    best_score: float = np.inf * (1 if early_stopping_metric == 'mse' else -1)
+    best_score: float = np.inf * (1 if early_stopping_metric == 'loss' else -1)
     best_score_step: int = init_num_examples
     use_gradient_accumulation: bool = not bool('grunet' in model_name)
     print(f'Output Directory: {str(output_directory)}')
@@ -203,6 +223,11 @@ def train_denoiser(
 
             num_validations += 1
             model.eval()
+
+            validation_time: float = 0
+            if run_smoke_test:
+                validation_time = time.time()
+
             with torch.no_grad():
 
                 if use_loss_contrastive:
@@ -246,6 +271,31 @@ def train_denoiser(
                         loss_reg=distfunc_reg, loss_segm=distfunc_segm,
                         weights=w, accumulation=use_gradient_accumulation)
 
+                # checkpoint whenever validation score improves
+                if early_stopping_metric == 'loss':
+                    save_ckpt = bool(metrics_vl['loss']<=best_score)
+                else:
+                    save_ckpt = bool(metrics_vl['sisdri']>=best_score)
+
+                if save_ckpt:
+                    best_score = metrics_vl[early_stopping_metric]
+                    best_score_step = num_examples
+                    best_state_dict = model.state_dict()
+                    ckpt_path = output_directory.joinpath('ckpt_best.pt')
+                    torch.save({
+                        'num_examples': num_examples,
+                        'model_name': model_name,
+                        'model_config': config,
+                        'model_state_dict': best_state_dict,
+                        'optimizer_state_dict': optimizer.state_dict()
+                    }, ckpt_path)
+                    if not called_by_ray:
+                        print(f'Examples: {num_examples:>10},\t'
+                              'Validation SI-SDRi: '+str(metrics_vl['sisdri']))
+                    step_path = output_directory.joinpath('best_step.txt')
+                    with open(step_path, 'w') as fp:
+                        print(num_examples, file=fp)
+
                 # write summaries
                 for (k, v) in metrics_tr.items():
                     if ('_inp' not in k) and ('_enh' not in k):
@@ -255,48 +305,42 @@ def train_denoiser(
                     if ('_inp' not in k) and ('_enh' not in k):
                         writer.add_scalar(
                             f'validation/{k}', float(v), num_examples)
-
-                # checkpoint whenever validation score improves
-                if early_stopping_metric == 'mse':
-                    save_ckpt = bool(metrics_vl['loss']<=best_score)
-                else:
-                    save_ckpt = bool(metrics_vl['sisdri']>=best_score)
-
-                if save_ckpt:
-                    best_score = {
-                        'mse': metrics_vl['loss'],
-                        'sisdri': metrics_vl['sisdri']
-                    }.get(early_stopping_metric, 0)
-                    best_score_step = num_examples
-                    ckpt_path = output_directory.joinpath('ckpt_best.pt')
-                    torch.save({
+                writer.add_scalar(
+                    f'validation/vl_score', best_score, num_examples)
+                if called_by_ray:
+                    _e = early_stopping_metric
+                    tune.report(**{
                         'num_examples': num_examples,
-                        'model_name': model_name,
-                        'model_config': config,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict()
-                    }, ckpt_path)
-                    print(f'Examples: {num_examples:>10},\t'
-                          'Validation SI-SDRi: '+str(metrics_vl['sisdri']))
-                    step_path = output_directory.joinpath('best_step.txt')
-                    with open(step_path, 'w') as fp:
-                        print(num_examples, file=fp)
+                        f'vl_{_e}': metrics_vl[_e],
+                        f'vl_score': best_score
+                    })
 
                 if num_examples > num_examples_minimum:
                     if num_examples - best_score_step > num_examples_earlystopping:
                         raise EarlyStopping()
 
+                if run_smoke_test:
+                    validation_time = time.time() - validation_time
+                    smoke_path = output_directory.joinpath(f'smoke_test.txt')
+                    with open(smoke_path, 'w') as fp:
+                        print('Validation Run-Time (in seconds):'
+                              f' {validation_time}', file=fp)
+                    raise SmokeTest()
+
     except EarlyStopping:
         step_path = output_directory.joinpath(f'early_stopping.txt')
         with open(step_path, 'w') as fp:
-            print('{},{}'.format(num_examples, best_score_step), file=fp)
+            print(f'{num_examples}\n{best_score_step}\n{best_score}', file=fp)
         print(f'Automatically exited after {num_examples_earlystopping} '
               f'examples; best model saw {best_score_step} examples.')
+
+    except SmokeTest:
+        print(f'Exiting due to smoke test.')
 
     except KeyboardInterrupt:
         print(f'Manually exited at {num_examples} examples; best model saw '
               f'{best_score_step} examples.')
-        sys.exit(-1)
+        raise KeyboardInterrupt
 
     torch.save({
         'num_examples': num_examples,
@@ -306,56 +350,25 @@ def train_denoiser(
         'optimizer_state_dict': optimizer.state_dict()
     }, output_directory.joinpath(f'ckpt_last.pt'))
 
+    # run the test set
+    model.load_state_dict(best_state_dict)
+    te_results = test_denoiser_with_speaker(model, num_examples_to_save=3)
+    te_results['num_examples'] = best_score_step
+    te_results[f'vl_{early_stopping_metric}'] = best_score
+
+    if called_by_ray:
+        tune.report(**te_results)
+
+    with open(output_directory.joinpath('test_results.json'), 'w',
+              encoding='utf-8') as fp:
+        json.dump(te_results, fp, indent=2, sort_keys=True)
+        print(json.dumps(te_results, indent=2, sort_keys=True), '\n')
+
     # close the summary
     writer.close()
-
-    # print the location of the checkpoints
     print(f'Output Directory: {str(output_directory)}')
 
     # exit the trainer
-    return str(output_directory)
-
-
-def ablation_study_contrastive(
-    model_name: str,
-    model_size: str,
-    lambda_p: float,
-    lambda_n: float,
-    output_folder: str = 'ablation_contrastive'
-):
-    """Runs an ablation study over the contrastive loss.
-
-    Args:
-        model_name: should be either 'grunet' or 'convtasnet'.
-        model_size: should be either 'small', 'medium', or 'large'.
-        lambda_p: scaling factor for positive pair loss terms
-        lambda_n: scaling factor for negative pair loss terms
-        output_folder: study output directory (default: "./ablation/")
-    """
-    for speaker_id in speaker_ids_te:
-        train_denoiser(
-            model_name=model_name,
-            model_size=model_size,
-            data_tr=ContrastiveMixtures(
-                speaker_id,
-                split_speech='pretrain',
-                snr_premixture=(0, 15),
-                snr_mixture=(-5, 5)),
-            data_vl=ContrastiveMixtures(
-                speaker_id,
-                split_speech='preval',
-                split_premixture='val',
-                snr_premixture=(0, 15),
-                split_mixture='val',
-                snr_mixture=(-5, 5)),
-            lambda_p=lambda_p,
-            lambda_n=lambda_n,
-            batch_size=128,
-            trial_name='{}_{}_sp{:03}_lp{}_ln{}'.format(
-                model_name, model_size,
-                speaker_id, int(lambda_p), int(lambda_n)
-            ), output_folder=output_folder
-        )
     return
 
 
@@ -443,7 +456,7 @@ def finetune_denoiser(
             # Begin training
             num_examples: int = 0
             num_validations: int = 0
-            best_score: float = np.inf * (1 if early_stopping_metric == 'mse'
+            best_score: float = np.inf * (1 if early_stopping_metric == 'loss'
                                           else
                                           -1)
             best_score_step: int = 0
@@ -483,13 +496,13 @@ def finetune_denoiser(
                                 f'validation/{k}', float(v), num_examples)
 
                     do_save_checkpoint = {
-                        'mse': bool(metrics_vl['loss'] <= best_score),
+                        'loss': bool(metrics_vl['loss'] <= best_score),
                         'sisdri': bool(metrics_vl['sisdri'] >= best_score)
                     }.get(early_stopping_metric, False)
 
                     if do_save_checkpoint:
                         best_score = {
-                            'mse': metrics_vl['loss'],
+                            'loss': metrics_vl['loss'],
                             'sisdri': metrics_vl['sisdri']
                         }.get(early_stopping_metric, 0)
                         best_score_step = num_examples
@@ -554,7 +567,7 @@ def parse_arguments(
     parser.add_argument('--distance_func', type=str,
                         choices={'mse', 'snr', 'sisdr'}, required=True)
     parser.add_argument('--early_stopping_metric', type=str,
-                        choices={'mse', 'sisdri'}, default='sisdri')
+                        choices={'loss', 'sisdri'}, default='sisdri')
     parser.add_argument("--premixture_snr",
                         type=t_mixture_snr, default='(0, 15)')
     parser.add_argument("--mixture_snr",
@@ -583,85 +596,224 @@ def parse_arguments(
     return args
 
 
-def main():
-    args = parse_arguments()
+def hparam_search_cm(
+        speaker_id_or_ids: Union[int, Sequence[int]] = 200,
+        num_cpus: int = 1,
+        num_gpus: int = 1
+):
+    # define the hyperparameter search space
+    search_space = {
+        'distance_func': tune.grid_search(['snr',]),
+        'use_loss_purification': tune.grid_search([False, True]),
+        'lambda_p': tune.grid_search([0, 0.0001, 0.0005, 0.001, 0.005,
+                                      0.01, 0.05, 0.1, 0.5, 1]),
+        'lambda_n': tune.grid_search([0, 0.0001, 0.0005, 0.001, 0.005,
+                                      0.01, 0.05, 0.1, 0.5, 1]),
+    }
 
-    dataset_class = (ContrastiveMixtures if args.use_loss_contrastive else
-                     Mixtures)
-
-    # train one or more specialist models
-    if args.speaker_id:
-
-        for speaker_id in args.speaker_id:
-
-            d_tr = dataset_class(speaker_id,
-                                 split_speech='pretrain',
-                                 split_premixture='train',
-                                 snr_premixture=args.premixture_snr,
-                                 split_mixture='train',
-                                 snr_mixture=args.mixture_snr)
-            d_vl = dataset_class(speaker_id,
-                                 split_speech='preval',
-                                 split_premixture='val',
-                                 snr_premixture=args.premixture_snr,
-                                 split_mixture='val',
-                                 snr_mixture=args.mixture_snr)
-            train_denoiser(
-                model_name=args.model_name,
-                model_size=args.model_size,
-                distance_func=args.distance_func,
-                data_tr=d_tr,
-                data_vl=d_vl,
-                lambda_p=args.lambda_p,
-                lambda_n=args.lambda_n,
-                learning_rate=args.learning_rate,
-                batch_size=args.batch_size,
-                use_loss_purification=args.use_loss_purification,
-                trial_name='{}_{}{}{}_sp{:03}'.format(
-                    args.model_name, args.model_size,
-                    '_yp' if args.use_loss_purification else '_np',
-                    '_yc' if args.use_loss_contrastive else '_nc',
-                    speaker_id
-                )+args.trial_suffix,
-                early_stopping_metric=args.early_stopping_metric,
-                checkpoint_path=args.warm_start,
-                output_folder=str(args.output_folder)
-            )
-
-    # train one generalist model
-    else:
-
-        d_tr = dataset_class(speaker_ids_tr,
-                             frac_speech=args.generalist_frac,
-                             split_mixture='train',
-                             snr_mixture=args.mixture_snr)
-        d_vl = dataset_class(speaker_ids_vl,
-                             split_mixture='val',
-                             snr_mixture=args.mixture_snr)
+    def ray_search_cm(config):
+        d_tr = ContrastiveMixtures(
+            speaker_id_or_ids, split_speech='pretrain',
+            split_premixture='train', snr_premixture=(0, 15),
+            split_mixture='train', snr_mixture=(-5, 5))
+        d_vl = ContrastiveMixtures(
+            speaker_id_or_ids, split_speech='preval',
+            split_premixture='val', snr_premixture=(0, 15),
+            split_mixture='val', snr_mixture=(-5, 5))
         train_denoiser(
-            model_name=args.model_name,
-            model_size=args.model_size,
-            distance_func=args.distance_func,
+            model_name='convtasnet',
+            model_size='small',
             data_tr=d_tr,
             data_vl=d_vl,
-            lambda_p=args.lambda_p,
-            lambda_n=args.lambda_n,
-            learning_rate=args.learning_rate,
-            batch_size=args.batch_size,
-            trial_name='{}_{}'.format(
-                args.model_name, args.model_size
-            )+args.trial_suffix,
-            early_stopping_metric=args.early_stopping_metric,
-            checkpoint_path=args.warm_start,
-            output_folder=str(args.output_folder)
+            use_loss_purification=config['use_loss_purification'],
+            lambda_p=config['lambda_p'],
+            lambda_n=config['lambda_n'],
+            output_folder='.',
+            distance_func=config['distance_func'],
+            called_by_ray=True,
         )
+        return
+
+    analysis = tune.run(
+        ray_search_cm,
+        name='ray_search_cm',
+        config=search_space,
+        resources_per_trial={'cpu': num_cpus, 'gpu': num_gpus},
+        reuse_actors=True,
+        log_to_file=True,
+        local_dir='.',
+        fail_fast=True,
+        verbose=1
+    )
+    ts = datetime.now().strftime('%b%d_%H-%M-%S')
+    analysis.results_df.to_csv(f'ray_search_cm/results_{ts}.csv')
     return
 
 
+def hparam_search_df(
+        speaker_id_or_ids: Union[int, Sequence[int]] = 200,
+        num_cpus: int = 1,
+        num_gpus: int = 1
+):
+    # define the hyperparameter search space
+    search_space = {
+        'model_size': tune.grid_search(['tiny', 'small', 'medium', 'large']),
+        'distance_func': tune.grid_search(['mse', 'snr', 'sisdr']),
+        'use_loss_purification': tune.grid_search([False, True]),
+    }
+
+    def ray_search_distance_func(config):
+        d_tr = Mixtures(
+            speaker_id_or_ids, split_speech='pretrain',
+            split_premixture='train', snr_premixture=(0, 15),
+            split_mixture='train', snr_mixture=(-5, 5))
+        d_vl = Mixtures(
+            speaker_id_or_ids, split_speech='preval',
+            split_premixture='val', snr_premixture=(0, 15),
+            split_mixture='val', snr_mixture=(-5, 5))
+        train_denoiser(
+            model_name='convtasnet',
+            model_size=config['model_size'],
+            data_tr=d_tr,
+            data_vl=d_vl,
+            use_loss_purification=config['use_loss_purification'],
+            output_folder='.',
+            distance_func=config['distance_func'],
+            called_by_ray=True,
+        )
+        return
+
+    analysis = tune.run(
+        ray_search_distance_func,
+        name='ray_search_distance_func',
+        config=search_space,
+        resources_per_trial={'cpu': num_cpus, 'gpu': num_gpus},
+        reuse_actors=True,
+        log_to_file=True,
+        local_dir='.',
+        fail_fast=True,
+        verbose=1
+    )
+    ts = datetime.now().strftime('%b%d_%H-%M-%S')
+    analysis.results_df.to_csv(f'ray_search_distance_func/results_{ts}.csv')
+    return
+
+
+def train_all_generalists(
+        num_cpus: int = 1,
+        num_gpus: int = 1
+):
+    # define the hyperparameter search space
+    search_space = {
+        'model_name': 'convtasnet',
+        'model_size': tune.grid_search(['medium', 'large']),
+        # 'model_size': tune.grid_search(['tiny', 'small', 'medium', 'large']),
+        'distance_func': tune.grid_search(['snr', 'sisdr']),
+        'generalist_frac': 1,
+        'batch_size': 64,
+        'learning_rate': 1e-3,
+        'mixture_snr': (-5, 5)
+    }
+
+    def train_generalist(config: dict):
+        train_denoiser(
+            model_name=config['model_name'],
+            model_size=config['model_size'],
+            distance_func=config['distance_func'],
+            data_tr=Mixtures(speaker_ids_tr,
+                             frac_speech=config['generalist_frac'],
+                             split_mixture='train',
+                             snr_mixture=config.get('mixture_snr', (-5, 5))),
+            data_vl=Mixtures(speaker_ids_vl,
+                             split_mixture='val',
+                             snr_mixture=config.get('mixture_snr', (-5, 5))),
+            learning_rate=config['learning_rate'],
+            batch_size=config['batch_size'],
+            output_folder='.',
+            called_by_ray=True,
+        )
+        return
+
+    analysis = tune.run(
+        train_generalist,
+        name='train_generalist',
+        config=search_space,
+        resources_per_trial={'cpu': num_cpus, 'gpu': num_gpus},
+        reuse_actors=True,
+        log_to_file=True,
+        local_dir='.',
+        fail_fast=True,
+        verbose=3
+    )
+    ts = datetime.now().strftime('%b%d_%H-%M-%S')
+    analysis.results_df.to_csv(f'train_generalist/results_{ts}.csv')
+    return
+
+
+def train_all_specialists(
+        num_cpus: int = 1,
+        num_gpus: int = 1
+):
+    # define the hyperparameter search space
+    search_space = {
+        'model_name': 'convtasnet',
+        'model_size': tune.grid_search(['tiny', 'small', 'medium', 'large']),
+        'distance_func': tune.grid_search(['snr',]),
+        'speaker_id': tune.grid_search([
+            201, 250, 254, 307, 405, 446,]),
+        'use_loss_contrastive': tune.grid_search([False,]),
+        'use_loss_purification': tune.grid_search([False, True]),
+        'batch_size': 64,
+        'learning_rate': 1e-3,
+        'run_smoke_test': False
+    }
+
+    def train_specialist(config: dict):
+        dc = Mixtures
+        if config.get('use_loss_contrastive', False):
+            dc = ContrastiveMixtures
+        train_denoiser(
+            model_name=config['model_name'],
+            model_size=config['model_size'],
+            distance_func=config['distance_func'],
+            data_tr=dc(config['speaker_id'],
+                       split_speech='pretrain',
+                       split_premixture='train',
+                       snr_premixture=config.get('premixture_snr', (0, 15)),
+                       split_mixture='train',
+                       snr_mixture=config.get('mixture_snr', (-5, 5))),
+            data_vl=dc(config['speaker_id'],
+                       split_speech='preval',
+                       split_premixture='val',
+                       snr_premixture=config.get('premixture_snr', (0, 15)),
+                       split_mixture='val',
+                       snr_mixture=config.get('mixture_snr', (-5, 5))),
+            learning_rate=config.get('learning_rate', 1e-3),
+            use_loss_purification=config.get('use_loss_purification', False),
+            batch_size=config['batch_size'],
+            output_folder='.',
+            called_by_ray=True,
+            run_smoke_test=config.get('run_smoke_test', False)
+        )
+        return
+
+    analysis = tune.run(
+        train_specialist,
+        name='train_specialist',
+        config=search_space,
+        resources_per_trial={'cpu': num_cpus, 'gpu': num_gpus},
+        reuse_actors=True,
+        log_to_file=True,
+        local_dir='.',
+        fail_fast=True,
+        verbose=3
+    )
+    ts = datetime.now().strftime('%b%d_%H-%M-%S')
+    analysis.results_df.to_csv(f'train_specialist/results_{ts}.csv')
+    return
+
 if __name__ == '__main__':
-    main()
-    # ablation_study_contrastive(
-    #     model_name=sys.argv[1], model_size=sys.argv[2],
-    #     lambda_p=float(sys.argv[3]), lambda_n=float(sys.argv[4]))
-    # finetune_denoiser(dataset_duration=float(sys.argv[1]),
-    #                   checkpoint_locations=sys.argv[2:])
+    # hparam_search_cm()
+    # hparam_search_df()
+    # train_all_generalists()
+    train_all_specialists()
