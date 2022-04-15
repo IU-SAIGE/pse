@@ -5,14 +5,12 @@ from contextlib import suppress
 from typing import Any, Optional, Union, Sequence, Tuple, Dict, Callable
 
 import asteroid.models
-from pesq import pesq
-from pystoi import stoi
 import torch
 import torch.nn.functional as tf
 from torch.nn.modules.loss import _Loss
 
 from exp_data import Mixtures, sample_rate, sisdr_improvement, \
-    data_te_generalist, sdr, sisdr
+    data_te_generalist, sdr, sisdr, wav_write
 from exp_utils import make_2d, make_3d, pad_x_to_y, shape_reconstructed
 
 
@@ -21,6 +19,16 @@ _hop_size: int = 256
 _eps: float = 1e-8
 _recover_noise: bool = False
 _window: torch.Tensor = torch.hann_window(_fft_size)
+try:
+    from pesq import pesq
+except ImportError:
+    pesq = lambda *a, **k: 0
+    print('Module `pesq` not installed, this metric will be a no-op.')
+try:
+    from pystoi import stoi
+except ImportError:
+    stoi = lambda *a, **k: 0
+    print('Module `pystoi` not installed, this metric will be a no-op.')
 
 
 def _forward_single_mask(self, waveform: torch.Tensor):
@@ -294,7 +302,9 @@ def feedforward(
         loss_segm: Callable,
         weights: Optional[torch.Tensor] = None,
         accumulation: bool = False,
-        test: bool = False
+        test: bool = False,
+        skip_input_metrics: bool = False,
+        num_examples_to_save: int = 0
 ) -> Dict[str, float]:
     """Runs a feedforward pass through a model by unraveling batched data.
     """
@@ -312,95 +322,59 @@ def feedforward(
     r_loss: float = 0
 
     with context:
-        if accumulation:
-            for i in range(batch_size):
+        for i in range(batch_size):
 
-                # unravel batch
-                x = inputs[i].unsqueeze(0).cuda()
-                t = targets[i].unsqueeze(0).cuda()
-
-                # forward pass
-                y = make_2d(model(x))
-
-                # backwards pass
-                if not test:
-                    if weights is not None:
-                        w = weights[i].unsqueeze(0)
-                        loss_tensor = torch.mean(
-                            loss_segm(y, t, w))
-                    else:
-                        loss_tensor = torch.mean(
-                            loss_reg(y, t))
-                    loss_tensor /= batch_size
-                    r_loss += float(loss_tensor)
-                if not (validation or test):
-                    loss_tensor.backward()
-
-                # compute PESQ and STOI (perceptual scores) only during testing
-                if test:
-                    _x = x.detach().cpu().numpy().squeeze()
-                    _y = y.detach().cpu().numpy().squeeze()
-                    _t = t.detach().cpu().numpy().squeeze()
-                    r_pesq_inp += pesq(sample_rate, _t, _x, 'wb')
-                    r_pesq_enh += pesq(sample_rate, _t, _y, 'wb')
-                    r_stoi_inp += stoi(_t, _x, sample_rate, True)
-                    r_stoi_enh += stoi(_t, _y, sample_rate, True)
-
-                # calculate signal improvement
-                r_sdr_inp += float(sdr(x, t, reduction='mean'))
-                r_sdr_enh += float(sdr(y, t, reduction='mean'))
-                r_sisdr_inp += float(sisdr(x, t, reduction='mean'))
-                r_sisdr_enh += float(sisdr(y, t, reduction='mean'))
-
-            r_sdr_inp /= batch_size
-            r_sdr_enh /= batch_size
-            r_sisdr_inp /= batch_size
-            r_sisdr_enh /= batch_size
-            r_pesq_inp /= batch_size
-            r_pesq_enh /= batch_size
-            r_stoi_inp /= batch_size
-            r_stoi_enh /= batch_size
-
-        else:
+            # unravel batch
+            x = inputs[i].unsqueeze(0).cuda()
+            t = targets[i].unsqueeze(0).cuda()
 
             # forward pass
-            inputs, targets = inputs.cuda(), targets.cuda()
-            estimates = make_2d(model(inputs))
-
-            # compute loss
-            if not test:
-                if weights is not None:
-                    loss_tensor = torch.mean(
-                        loss_segm(estimates, targets, weights))
-                else:
-                    loss_tensor = torch.mean(
-                        loss_reg(estimates, targets))
-                r_loss = float(loss_tensor)
+            y = make_2d(model(x))
+            if 0 <= i < num_examples_to_save:
+                wav_write(f'example_{i:02d}.wav',
+                          y.reshape(-1).detach().cpu().numpy())
 
             # backwards pass
+            if not test:
+                if weights is not None:
+                    w = weights[i].unsqueeze(0)
+                    loss_tensor = torch.mean(
+                        loss_segm(y, t, w))
+                else:
+                    loss_tensor = torch.mean(
+                        loss_reg(y, t))
+                loss_tensor /= batch_size
+                r_loss += float(loss_tensor)
             if not (validation or test):
                 loss_tensor.backward()
 
             # compute PESQ and STOI (perceptual scores) only during testing
             if test:
-                _x = inputs.detach().cpu().numpy().squeeze()
-                _y = estimates.detach().cpu().numpy().squeeze()
-                _t = targets.detach().cpu().numpy().squeeze()
-                for i in range(batch_size):
-                    r_pesq_inp += pesq(sample_rate, _t[i], _x[i], 'wb')
-                    r_pesq_enh += pesq(sample_rate, _t[i], _y[i], 'wb')
-                    r_stoi_inp += stoi(_t[i], _x[i], sample_rate, True)
-                    r_stoi_enh += stoi(_t[i], _y[i], sample_rate, True)
-                r_pesq_inp /= batch_size
-                r_pesq_enh /= batch_size
-                r_stoi_inp /= batch_size
-                r_stoi_enh /= batch_size
+                _x = x.detach().cpu().numpy().squeeze()
+                _y = y.detach().cpu().numpy().squeeze()
+                _t = t.detach().cpu().numpy().squeeze()
+                if not skip_input_metrics:
+                    r_pesq_inp += pesq(sample_rate, _t, _x, 'wb')
+                r_pesq_enh += pesq(sample_rate, _t, _y, 'wb')
+                if not skip_input_metrics:
+                    r_stoi_inp += stoi(_t, _x, sample_rate, True)
+                r_stoi_enh += stoi(_t, _y, sample_rate, True)
 
             # calculate signal improvement
-            r_sdr_inp = float(sdr(inputs, targets, reduction='mean'))
-            r_sdr_enh = float(sdr(estimates, targets, reduction='mean'))
-            r_sisdr_inp = float(sisdr(inputs, targets, reduction='mean'))
-            r_sisdr_enh = float(sisdr(estimates, targets, reduction='mean'))
+            if not skip_input_metrics:
+                r_sdr_inp += float(sdr(x, t, reduction='mean'))
+            r_sdr_enh += float(sdr(y, t, reduction='mean'))
+            r_sisdr_inp += float(sisdr(x, t, reduction='mean'))
+            r_sisdr_enh += float(sisdr(y, t, reduction='mean'))
+
+        r_sdr_inp /= batch_size
+        r_sdr_enh /= batch_size
+        r_sisdr_inp /= batch_size
+        r_sisdr_enh /= batch_size
+        r_pesq_inp /= batch_size
+        r_pesq_enh /= batch_size
+        r_stoi_inp /= batch_size
+        r_stoi_enh /= batch_size
 
     return dict(loss=r_loss,
                 sdr_inp=r_sdr_inp,
@@ -413,6 +387,15 @@ def feedforward(
                 stoi_inp=r_stoi_inp,
                 stoi_enh=r_stoi_enh,
     )
+
+
+def contrastive_negative_term(ly, lt, term_type: str = 'max'):
+    if term_type == 'max':
+        return torch.mean(torch.max(ly, lt))
+    elif term_type == 'abs':
+        return torch.mean(torch.abs(ly - lt))
+    else:
+        return torch.mean(torch.pow(ly - lt, 2))
 
 
 def contrastive_feedforward(
@@ -428,6 +411,7 @@ def contrastive_feedforward(
         model: torch.nn.Module,
         weights_1: Optional[torch.Tensor] = None,
         weights_2: Optional[torch.Tensor] = None,
+        negative_term_type: str = 'max',
         accumulation: bool = False,
         validation: bool = False,
         test: bool = False
@@ -436,89 +420,26 @@ def contrastive_feedforward(
     """
     labels = labels.bool()
     batch_size = inputs_1.shape[0]
-    context = torch.no_grad() if (validation or test) else suppress()
+    context = torch.no_grad() if validation else suppress()
+    ratio_pos = float(sum(labels) / batch_size)
+    ratio_neg = float(sum(~labels) / batch_size)
+    use_dp = bool(weights_1 is not None) and bool(weights_2 is not None)
     r_sisdri: float = 0
     r_loss: float = 0
     r_loss_sig: float = 0
     r_loss_pos: float = 0
     r_loss_neg: float = 0
-    ratio_pos = float(sum(labels) / batch_size)
-    ratio_neg = float(sum(~labels) / batch_size)
-    use_dp = bool(weights_1 is not None) and bool(weights_2 is not None)
 
     with context:
-        if accumulation:
-            for i in range(batch_size):
+        for i in range(batch_size):
 
-                loss_tensor_sig, loss_tensor_pos, loss_tensor_neg = 0, 0, 0
-
-                # unravel batch
-                x_1 = inputs_1[i].unsqueeze(0).cuda()
-                x_2 = inputs_2[i].unsqueeze(0).cuda()
-                t_1 = targets_1[i].unsqueeze(0).cuda()
-                t_2 = targets_2[i].unsqueeze(0).cuda()
-
-                # forward pass
-                y_1 = make_2d(model(x_1))
-                y_2 = make_2d(model(x_2))
-
-                # stack for batchwise loss
-                x = torch.cat([x_1, x_2], dim=0)
-                t = torch.cat([t_1, t_2], dim=0)
-                y = torch.cat([y_1, y_2], dim=0)
-
-                # calculate loss
-                if not test:
-                    if use_dp:
-                        w_1 = weights_1[i].unsqueeze(0).cuda()
-                        w_2 = weights_2[i].unsqueeze(0).cuda()
-                        w_p = w_1 * w_2
-                        w = torch.cat([w_1, w_2], dim=0)
-                        loss_tensor_sig = torch.mean(loss_segm(y, t, w))
-                        if labels[i]:
-                            loss_tensor_pos = lambda_positive * torch.mean(
-                                loss_segm(y_1, y_2, w_1))
-                        else:
-                            loss_tensor_neg = lambda_negative * torch.mean(
-                                torch.pow(loss_segm(y_1, y_2, w_p) -
-                                          loss_segm(t_1, t_2, w_p), 2))
-                    else:
-                        loss_tensor_sig = torch.mean(loss_reg(y, t))
-                        if labels[i]:
-                            loss_tensor_pos = lambda_positive * torch.mean(
-                                loss_reg(y_1, y_2))
-                        else:
-                            loss_tensor_neg = lambda_negative * torch.mean(
-                                torch.pow(loss_reg(y_1, y_2) -
-                                          loss_reg(t_1, t_2), 2))
-
-                    loss_tensor_sig /= batch_size
-                    loss_tensor_pos /= (batch_size/2)
-                    loss_tensor_neg /= (batch_size/2)
-                    r_loss += float(loss_tensor_sig + loss_tensor_pos +
-                        loss_tensor_neg)
-                    r_loss_sig += float(loss_tensor_sig)
-                    r_loss_pos += float(loss_tensor_pos)
-                    r_loss_neg += float(loss_tensor_neg)
-
-                    # backwards pass
-                    if not validation:
-                        (loss_tensor_sig + loss_tensor_pos +
-                         loss_tensor_neg).backward()
-
-                # calculate signal improvement
-                r_sisdri += float(sisdr_improvement(y, t, x, 'mean'))
-
-            r_sisdri /= batch_size
-
-        # TODO: copy logic from gradient accumulated version down here
-        else:
+            loss_tensor_sig, loss_tensor_pos, loss_tensor_neg = 0, 0, 0
 
             # unravel batch
-            x_1 = inputs_1.cuda()
-            x_2 = inputs_2.cuda()
-            t_1 = targets_1.cuda()
-            t_2 = targets_2.cuda()
+            x_1 = inputs_1[i].unsqueeze(0).cuda()
+            x_2 = inputs_2[i].unsqueeze(0).cuda()
+            t_1 = targets_1[i].unsqueeze(0).cuda()
+            t_2 = targets_2[i].unsqueeze(0).cuda()
 
             # forward pass
             y_1 = make_2d(model(x_1))
@@ -528,40 +449,48 @@ def contrastive_feedforward(
             x = torch.cat([x_1, x_2], dim=0)
             t = torch.cat([t_1, t_2], dim=0)
             y = torch.cat([y_1, y_2], dim=0)
-            l = labels
 
             # calculate loss
-            if not test:
-                if use_dp:
-                    w_1 = weights_1.cuda()
-                    w_2 = weights_2.cuda()
-                    w_p = w_1 * w_2
-                    w = torch.cat([w_1, w_2], dim=0)
-                    loss_tensor = torch.mean(loss_segm(y, t, w))
-                    if ratio_pos:
-                        loss_tensor += lambda_positive * ratio_pos * torch.mean(
-                            loss_segm(y_1[l], y_2[l], w_1[l]))
-                    if ratio_neg:
-                        loss_tensor += lambda_negative * ratio_neg * torch.mean(
-                            torch.pow(loss_segm(t_1[~l], t_2[~l], w_p[~l]) -
-                                      loss_segm(y_1[~l], y_2[~l], w_p[~l]), 2))
+            if use_dp:
+                w_1 = weights_1[i].unsqueeze(0).cuda()
+                w_2 = weights_2[i].unsqueeze(0).cuda()
+                w_p = w_1 * w_2
+                w = torch.cat([w_1, w_2], dim=0)
+                loss_tensor_sig = torch.mean(loss_segm(y, t, w))
+                if labels[i]:
+                    loss_tensor_pos = torch.mean(
+                        loss_segm(y_1, y_2, w_1))
                 else:
-                    loss_tensor = torch.mean(loss_reg(y, t))
-                    if ratio_pos:
-                        loss_tensor += lambda_positive * ratio_pos * torch.mean(
-                            loss_reg(y_1[l], y_2[l]))
-                    if ratio_neg:
-                        loss_tensor += lambda_negative * ratio_neg * torch.mean(
-                            torch.pow(loss_reg(t_1[~l], t_2[~l]) -
-                                      loss_reg(y_1[~l], y_2[~l]), 2))
-                r_loss = float(loss_tensor)
+                    loss_tensor_neg = contrastive_negative_term(
+                        loss_segm(y_1, y_2, w_p), loss_segm(t_1, t_2, w_p))
+            else:
+                loss_tensor_sig = torch.mean(loss_reg(y, t))
+                if labels[i]:
+                    loss_tensor_pos = torch.mean(
+                        loss_reg(y_1, y_2))
+                else:
+                    loss_tensor_neg = contrastive_negative_term(
+                        loss_reg(y_1, y_2), loss_reg(t_1, t_2))
 
-                # backwards pass
-                if not validation:
-                    loss_tensor.backward()
+            loss_tensor_sig /= batch_size
+            loss_tensor_pos *= lambda_positive / (batch_size / 2)
+            loss_tensor_neg *= lambda_negative / (batch_size / 2)
+            loss_tensor_total = (
+                    loss_tensor_sig + loss_tensor_pos + loss_tensor_neg)
+
+            r_loss += float(loss_tensor_total)
+            r_loss_sig += float(loss_tensor_sig)
+            r_loss_pos += float(loss_tensor_pos)
+            r_loss_neg += float(loss_tensor_neg)
+
+            # backwards pass
+            if not validation:
+                loss_tensor_total.backward()
 
             # calculate signal improvement
             r_sisdri += float(sisdr_improvement(y, t, x, 'mean'))
+
+        r_sisdri /= batch_size
 
     return dict(loss=r_loss,
                 loss_sig=r_loss_sig,
@@ -655,9 +584,10 @@ def init_model(
 
 def load_checkpoint(
         path: Union[str, os.PathLike]
-) -> (torch.nn.Module, dict):
+) -> (torch.nn.Module, dict, int):
 
     input_path = pathlib.Path(path)
+    print(input_path)
 
     # If the path suffix is the PyTorch file extension,
     # then it's already a checkpoint
@@ -695,14 +625,36 @@ def load_checkpoint(
     model = init_model(model_name=config.get('model_name'),
                        model_size=config.get('model_size'))[0]
     ckpt = torch.load(checkpoint_path)
-    model.load_state_dict(ckpt.get('model_state_dict'), strict=True)
-    # model.cuda()
+    num_examples: int = ckpt.get('num_examples')
+    try:
+        model.load_state_dict(ckpt.get('model_state_dict'), strict=True)
+    except RuntimeError as e:
+        if 'state_dict' in str(e):
+            raise RuntimeError(f'{str(checkpoint_path)} is a mismatched model.')
+    model.cuda()
 
-    return model, config
+    return model, config, num_examples
 
 
 def count_parameters(network: Any) -> int:
     return sum(p.numel() for p in network.parameters() if p.requires_grad)
+
+
+
+def test_denoiser_with_speaker(
+        model: torch.nn.Module,
+        speaker_id: int = 200,
+        num_examples_to_save: int = 0
+) -> dict:
+    no_op_loss = lambda *a, **k: 0
+    dataset = Mixtures(speaker_id, split_speech='test', split_mixture='test',
+                       snr_mixture=(-5, 5))
+    batch = dataset(100, seed=0)
+    results = feedforward(batch.inputs, batch.targets, model,
+                          weights=None, accumulation=True,
+                          loss_reg=no_op_loss, loss_segm=no_op_loss,
+                          test=True, num_examples_to_save=num_examples_to_save)
+    return results
 
 
 @torch.no_grad()
@@ -733,7 +685,7 @@ def test_denoiser_from_file(
         checkpoint_path: Union[str, os.PathLike],
         data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
         accumulation: bool = False
-) -> Tuple[dict, int]:
+) -> dict:
     """Evaluates speech enhancement model checkpoint using provided dataset.
     """
     # load a config yaml file which should be in the same location
@@ -746,12 +698,14 @@ def test_denoiser_from_file(
     model = init_model(model_name=config.get('model_name'),
                        model_size=config.get('model_size'))[0]
     ckpt = torch.load(checkpoint_path)
-    num_examples = ckpt.get('num_examples')
+    num_examples: int = ckpt.get('num_examples')
     model.load_state_dict(ckpt.get('model_state_dict'), strict=True)
     model.cuda()
 
-    return (test_denoiser_from_module(model, data_te, accumulation),
-            num_examples)
+    results = test_denoiser_from_module(model, data_te, accumulation)
+    results['num_examples'] = num_examples
+
+    return results
 
 
 @torch.no_grad()
