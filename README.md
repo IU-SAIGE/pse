@@ -18,10 +18,10 @@ This work presents self-supervised learning (SSL) methods for developing monaura
 ## Proposed Methods
 
 ### Pseudo Speech Enhancement (PseudoSE)
-<img src="docs/images/waveforms_pseudose.png" alt="Pseudo Speech Enhancement">
+<img src="docs/images/waveforms_pseudose.png" alt="Pseudo Speech Enhancement" width="400px">
 
 ### Contrastive Mixtures (CM)
-<img src="docs/images/waveforms_cm.png" alt="Contrastive Mixtures">
+<img src="docs/images/waveforms_cm.png" alt="Contrastive Mixtures" width="400px">
 
 ### Data Purification (DP)
 <img src="docs/images/dp_overview.png" alt="Data Purification">
