@@ -728,5 +728,4 @@ FodyWeavers.xsd
 # ignore everything inside of checkpoint directories
 *.json
 *.pt
-*.txt
 events.out.*
