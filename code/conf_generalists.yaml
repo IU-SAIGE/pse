@@ -1,0 +1,53 @@
+# This YAML configuration file defines the generalists experiment search space.
+# All values provided in a list expand the search space.
+#
+# For example, if model_name is ["convtasnet", "grunet"] and speaker_id is
+# [19, 26, 39], then there are six experiments total. As another example, if
+# model_name and speaker_id are defined as before, and use_loss_contrastive is
+# [False, True] and use_loss_purification is [False, True], then there would
+# be twenty-four experiments total to run.
+#
+# Most importantly, the speaker_id value designates the personalization target;
+# the self-supervised models are trained using already-noisy single-speaker
+# observations (e.g., 19 + FSD50K, 26 + FSD50K).
+
+# -----------------------------------------------------------------------------
+# ray configuration
+# -----------------------------------------------------------------------------
+available_devices: '4,5,6,7'  # (these should be GPU IDs, check `nvidia-smi`)
+num_gpus_per_experiment: 0.5
+num_cpus_per_experiment: 0.5
+output_folder: "~/ray_results/"
+
+# -----------------------------------------------------------------------------
+# data configuration
+# -----------------------------------------------------------------------------
+folder_librispeech: "/data/asivara/librispeech/"
+folder_musan: "/data/asivara/musan/"
+
+sample_rate: 16000
+example_duration: 4  # (in seconds)
+
+batch_size:  # (should be specified based on available GPU memory)
+    - 64
+
+# -----------------------------------------------------------------------------
+# model configuration
+# -----------------------------------------------------------------------------
+model_name:  # (choices: "convtasnet", "grunet")
+    - 'convtasnet'
+    # - 'grunet'
+
+model_size:  # (choices: "tiny", "small", "medium", "large")
+    - 'tiny'
+    - 'small'
+    - 'medium'
+    - 'large'
+
+learning_rate:
+    - 0.001
+
+distance_func:  # (distance function used to compare estimate & target signals)
+    - 'snr'
+    # - 'sisdr'
+    # - 'mse'

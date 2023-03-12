@@ -1,6 +1,8 @@
 import numpy as np
+import os
 import torch
 import torch.nn.functional
+import yaml
 
 
 class EarlyStopping(Exception):
@@ -68,3 +70,30 @@ def shape_reconstructed(reconstructed: torch.Tensor, size: torch.Tensor):
     if len(size) == 1:
         return reconstructed.squeeze(0)
     return reconstructed
+
+
+def get_config_from_yaml(yaml_filepath: str):
+
+    if not os.path.exists(yaml_filepath):
+        raise OSError(f'{yaml_filepath} not found')
+
+    config = {}
+    with open(yaml_filepath) as fp:
+        config = yaml.safe_load(fp)
+        nonlist_keys = (
+            'available_devices',
+            'num_gpus_per_experiment',
+            'num_cpus_per_experiment',
+            'output_folder',
+            'folder_librispeech',
+            'folder_fsd50k',
+            'folder_musan',
+            'sample_rate',
+            'example_duration',
+        )
+        for k in config.keys():
+            if k not in nonlist_keys:
+                if not isinstance(config[k], list):
+                    config[k] = [config[k],]
+
+    return config

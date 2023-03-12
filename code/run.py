@@ -24,9 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from exp_data import ContrastiveMixtures, Mixtures
 from exp_data import example_duration, sample_rate
-from exp_data import speaker_ids_tr, speaker_ids_vl, speaker_ids_te
-from exp_models import SegmentalLoss, SNRPredictor, init_model, load_checkpoint, \
-    test_denoiser_with_speaker
+from exp_models import SegmentalLoss, SNRPredictor, init_model, load_checkpoint
 from exp_models import contrastive_feedforward, feedforward
 from exp_utils import EarlyStopping, ExperimentError, SmokeTest
 
@@ -349,20 +347,6 @@ def train_denoiser(
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict()
     }, output_directory.joinpath(f'ckpt_last.pt'))
-
-    # run the test set
-    model.load_state_dict(best_state_dict)
-    te_results = test_denoiser_with_speaker(model, num_examples_to_save=3)
-    te_results['num_examples'] = best_score_step
-    te_results[f'vl_{early_stopping_metric}'] = best_score
-
-    if called_by_ray:
-        tune.report(**te_results)
-
-    with open(output_directory.joinpath('test_results.json'), 'w',
-              encoding='utf-8') as fp:
-        json.dump(te_results, fp, indent=2, sort_keys=True)
-        print(json.dumps(te_results, indent=2, sort_keys=True), '\n')
 
     # close the summary
     writer.close()
@@ -698,122 +682,3 @@ def hparam_search_df(
     analysis.results_df.to_csv(f'ray_search_distance_func/results_{ts}.csv')
     return
 
-
-def train_all_generalists(
-        num_cpus: int = 1,
-        num_gpus: int = 1
-):
-    # define the hyperparameter search space
-    search_space = {
-        'model_name': 'convtasnet',
-        'model_size': tune.grid_search(['medium', 'large']),
-        # 'model_size': tune.grid_search(['tiny', 'small', 'medium', 'large']),
-        'distance_func': tune.grid_search(['snr', 'sisdr']),
-        'generalist_frac': 1,
-        'batch_size': 64,
-        'learning_rate': 1e-3,
-        'mixture_snr': (-5, 5)
-    }
-
-    def train_generalist(config: dict):
-        train_denoiser(
-            model_name=config['model_name'],
-            model_size=config['model_size'],
-            distance_func=config['distance_func'],
-            data_tr=Mixtures(speaker_ids_tr,
-                             frac_speech=config['generalist_frac'],
-                             split_mixture='train',
-                             snr_mixture=config.get('mixture_snr', (-5, 5))),
-            data_vl=Mixtures(speaker_ids_vl,
-                             split_mixture='val',
-                             snr_mixture=config.get('mixture_snr', (-5, 5))),
-            learning_rate=config['learning_rate'],
-            batch_size=config['batch_size'],
-            output_folder='.',
-            called_by_ray=True,
-        )
-        return
-
-    analysis = tune.run(
-        train_generalist,
-        name='train_generalist',
-        config=search_space,
-        resources_per_trial={'cpu': num_cpus, 'gpu': num_gpus},
-        reuse_actors=True,
-        log_to_file=True,
-        local_dir='.',
-        fail_fast=True,
-        verbose=3
-    )
-    ts = datetime.now().strftime('%b%d_%H-%M-%S')
-    analysis.results_df.to_csv(f'train_generalist/results_{ts}.csv')
-    return
-
-
-def train_all_specialists(
-        num_cpus: int = 1,
-        num_gpus: int = 1
-):
-    # define the hyperparameter search space
-    search_space = {
-        'model_name': 'convtasnet',
-        'model_size': tune.grid_search(['tiny', 'small', 'medium', 'large']),
-        'distance_func': tune.grid_search(['snr',]),
-        'speaker_id': tune.grid_search([
-            201, 250, 254, 307, 405, 446,]),
-        'use_loss_contrastive': tune.grid_search([False,]),
-        'use_loss_purification': tune.grid_search([False, True]),
-        'batch_size': 64,
-        'learning_rate': 1e-3,
-        'run_smoke_test': False
-    }
-
-    def train_specialist(config: dict):
-        dc = Mixtures
-        if config.get('use_loss_contrastive', False):
-            dc = ContrastiveMixtures
-        train_denoiser(
-            model_name=config['model_name'],
-            model_size=config['model_size'],
-            distance_func=config['distance_func'],
-            data_tr=dc(config['speaker_id'],
-                       split_speech='pretrain',
-                       split_premixture='train',
-                       snr_premixture=config.get('premixture_snr', (0, 15)),
-                       split_mixture='train',
-                       snr_mixture=config.get('mixture_snr', (-5, 5))),
-            data_vl=dc(config['speaker_id'],
-                       split_speech='preval',
-                       split_premixture='val',
-                       snr_premixture=config.get('premixture_snr', (0, 15)),
-                       split_mixture='val',
-                       snr_mixture=config.get('mixture_snr', (-5, 5))),
-            learning_rate=config.get('learning_rate', 1e-3),
-            use_loss_purification=config.get('use_loss_purification', False),
-            batch_size=config['batch_size'],
-            output_folder='.',
-            called_by_ray=True,
-            run_smoke_test=config.get('run_smoke_test', False)
-        )
-        return
-
-    analysis = tune.run(
-        train_specialist,
-        name='train_specialist',
-        config=search_space,
-        resources_per_trial={'cpu': num_cpus, 'gpu': num_gpus},
-        reuse_actors=True,
-        log_to_file=True,
-        local_dir='.',
-        fail_fast=True,
-        verbose=3
-    )
-    ts = datetime.now().strftime('%b%d_%H-%M-%S')
-    analysis.results_df.to_csv(f'train_specialist/results_{ts}.csv')
-    return
-
-if __name__ == '__main__':
-    # hparam_search_cm()
-    # hparam_search_df()
-    # train_all_generalists()
-    train_all_specialists()

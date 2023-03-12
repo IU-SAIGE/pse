@@ -1,4 +1,5 @@
 import os
+import sys
 import pathlib
 from collections import namedtuple
 from typing import List, Optional, Sequence, Tuple, Union, Callable
@@ -17,23 +18,11 @@ from scipy.signal import convolve
 
 from exp_utils import ExperimentError
 
+ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
+
 example_duration: float = 4
 sample_rate: int = 16000
 example_length: int = int(sample_rate * example_duration)
-
-_host = str(socket.gethostname().split('.')[-3:].pop(0))
-_root_data: str = dict(
-    audio='/media/sdc1/',
-    transformer='/data/asivara/',
-    juliet='/N/u/asivara/datasets/',
-    gan='/media/sdb1/Data/'
-).get(_host, '/N/u/asivara/datasets/')
-_root_librispeech: str = _root_data + '/librispeech/'
-_root_demand: str = _root_data + '/demand/'
-_root_fsd50k: str = _root_data + '/fsd50k_16khz/'
-_root_musan: str = _root_data + '/musan/'
-_root_irsurvey: str = _root_data + '/ir_survey_16khz/'
-_root_slr28: str = _root_data + '/RIRS_NOISES/'
 
 _eps: float = 1e-8
 _rng = np.random.default_rng(0)
@@ -43,6 +32,7 @@ Batch = namedtuple(
 ContrastiveBatch = namedtuple(
     'ContrastiveBatch', ('inputs_1','targets_1','inputs_2','targets_2',
                          'labels','pre_snrs','post_snrs'))
+
 
 def _make_2d(x: torch.Tensor):
     """Normalize shape of `x` to two dimensions: [batch, time]."""
@@ -97,7 +87,7 @@ def sparsity_index(
     """Defines a sparsity value for a given signal, by computing the
     standard deviation of the segmental root-mean-square (RMS).
     """
-    return float(np.std(librosa.feature.rms(signal).reshape(-1)))
+    return float(np.std(librosa.feature.rms(y=signal).reshape(-1)))
 
 
 def wav_read(
@@ -222,14 +212,26 @@ def sdr_improvement(
 
 
 def dataframe_librispeech(
-        dataset_directory: Union[str, os.PathLike] = _root_librispeech,
+        dataset_directory: Optional[Union[str, os.PathLike]] = None,
         omit_clipped: bool = False
 ) -> pd.DataFrame:
     """Creates a Pandas DataFrame with files from the LibriSpeech corpus.
     Root directory should mimic archive-extracted folder structure.
     Dataset may be downloaded at `<https://www.openslr.org/12/>`_.
-    """
+    """    
+    columns = [
+        'subset_id',
+        'speaker_id',
+        'chapter_id',
+        'utterance_id',
+        'filepath',
+        'duration',
+        'sparsity'
+    ]    
+    if dataset_directory is None: 
+        return pd.DataFrame(columns=columns)
     dataset_directory = pathlib.Path(dataset_directory)
+    dataset_dataframe = pathlib.Path(ROOT_DIR).joinpath('datasets', 'librispeech.csv')
     if not dataset_directory.exists():
         raise ValueError(f'{dataset_directory} does not exist.')
     valid_subsets = [
@@ -238,20 +240,15 @@ def dataframe_librispeech(
         'dev-clean',
         'test-clean'
     ]
-    if not dataset_directory.joinpath('dataframe.csv').exists():
+    if not dataset_dataframe.exists():
+        raise ValueError(f'{dataset_dataframe} does not exist')
         rows = []
-        columns = [
-            'subset_id',
-            'speaker_id',
-            'chapter_id',
-            'utterance_id',
-            'filepath',
-            'duration',
-            'sparsity'
-        ]
-        for filepath in sorted(dataset_directory.rglob('*.wav')):
-            subset_id = [_ for _ in valid_subsets if _ in str(filepath)][0]
-            speaker_id, chapter_id, utterance_id = filepath.stem.split('-')
+        for filepath in dataset_directory.rglob('*.wav'):
+            try:
+                subset_id = [_ for _ in valid_subsets if _ in str(filepath)][0]
+                speaker_id, chapter_id, utterance_id = filepath.stem.split('-')
+            except ValueError:
+                continue
             y, duration = wav_read(filepath)
             sparsity = sparsity_index(y)
             rows.append((subset_id, speaker_id, chapter_id,
@@ -260,12 +257,16 @@ def dataframe_librispeech(
             raise ValueError(f'Could not find any .WAV files within '
                              f'{dataset_directory}.')
         df = pd.DataFrame(rows, columns=columns)
-        df.to_csv(dataset_directory.joinpath('dataframe.csv'),
+        df.to_csv(dataset_dataframe,
                   header=columns,
                   index=False,
                   index_label=False)
     else:
-        df = pd.read_csv(dataset_directory.joinpath('dataframe.csv'))
+        df = pd.read_csv(dataset_dataframe)
+
+    dataset_directory = str(dataset_directory)
+    df = df.sort_values('filepath', ascending=True).reset_index(drop=True)
+    df['filepath'] = df['filepath'].apply(lambda f: os.path.join(dataset_directory, f))
 
     if omit_clipped:
         # discard recordings from speakers who possess clipped recordings
@@ -313,11 +314,17 @@ def dataframe_librispeech(
         assert (split_vl != split_tr), (sp_id, split_vl, split_tr)
         assert (split_tr != split_pvl), (sp_id, split_tr, split_pvl)
 
+        sgroup = sgroup.reset_index(drop=True)
+
         # assign split
-        sgroup.iloc[0:split_te]['split'] = 'test'
-        sgroup.iloc[split_te:split_vl]['split'] = 'val'
-        sgroup.iloc[split_vl:split_tr]['split'] = 'train'
-        sgroup.iloc[split_tr:split_pvl]['split'] = 'preval'
+        for i in range(0, split_te):
+            sgroup.at[i, 'split'] = 'test'
+        for i in range(split_te, split_vl):
+            sgroup.at[i, 'split'] = 'val'
+        for i in range(split_vl, split_tr):
+            sgroup.at[i, 'split'] = 'train'
+        for i in range(split_tr, split_pvl):
+            sgroup.at[i, 'split'] = 'preval'
 
         # return the modified speaker group
         return sgroup
@@ -348,54 +355,55 @@ def dataframe_librispeech(
 
 
 def dataframe_demand(
-        dataset_directory: Union[str, os.PathLike] = _root_demand,
-        empty: bool = False,
+        dataset_directory: Optional[Union[str, os.PathLike]] = None
 ) -> pd.DataFrame:
     """Creates a Pandas DataFrame with files from the DEMAND corpus.
     Root directory should mimic archive-extracted folder structure.
     Dataset may be downloaded at `<https://www.zenodo.org/record/1227121/>`_.
     """
-    if empty:
-        return pd.DataFrame(columns=['filepath', 'duration', 'sparsity'])
+    columns = [
+        'category_id',
+        'location_id',
+        'filepath',
+        'duration',
+        'sparsity'
+    ]
+    if dataset_directory is None: 
+        return pd.DataFrame(columns=columns)
     dataset_directory = pathlib.Path(dataset_directory)
+    dataset_dataframe = pathlib.Path(ROOT_DIR).joinpath('datasets', 'demand.csv')
     if not dataset_directory.exists():
         raise ValueError(f'{dataset_directory} does not exist.')
-    if not dataset_directory.joinpath('dataframe.csv').exists():
+    valid_categories = [
+        'domestic',
+        'nature',
+        'office',
+        'public',
+        'street',
+        'transportation'
+    ]
+    valid_locations = [
+        'kitchen',
+        'washing',
+        'park',
+        'hallway',
+        'office',
+        'resto',
+        'psquare',
+        'bus',
+        'metro',
+        'living',
+        'field',
+        'river',
+        'meeting',
+        'cafeter',
+        'station',
+        'traffic',
+        'car'
+    ]
+    if not dataset_dataframe.exists():
+        raise ValueError(f'{dataset_dataframe} does not exist')
         rows = []
-        valid_categories = [
-            'domestic',
-            'nature',
-            'office',
-            'public',
-            'street',
-            'transportation'
-        ]
-        valid_locations = [
-            'kitchen',
-            'washing',
-            'park',
-            'hallway',
-            'office',
-            'resto',
-            'psquare',
-            'bus',
-            'metro',
-            'living',
-            'field',
-            'river',
-            'meeting',
-            'cafeter',
-            'station',
-            'traffic',
-            'car'
-        ]
-        columns = [
-            'category_id',
-            'location_id',
-            'filepath',
-            'duration',
-            'sparsity'
-        ]
         for filepath in sorted(dataset_directory.rglob('*.wav')):
             if 'ch01' not in filepath.stem:
                 continue
@@ -415,12 +423,16 @@ def dataframe_demand(
             raise ValueError(f'Could not find any .WAV files within '
                              f'{dataset_directory}.')
         df = pd.DataFrame(rows, columns=columns)
-        df.to_csv(dataset_directory.joinpath('dataframe.csv'),
+        df.to_csv(dataset_dataframe,
                   header=columns,
                   index=False,
                   index_label=False)
     else:
-        df = pd.read_csv(dataset_directory.joinpath('dataframe.csv'))
+        df = pd.read_csv(dataset_dataframe)
+
+    dataset_directory = str(dataset_directory)
+    df = df.sort_values('filepath', ascending=True).reset_index(drop=True)
+    df['filepath'] = df['filepath'].apply(lambda f: os.path.join(dataset_directory, f))
 
     # shuffle the recordings
     df = df.sample(frac=1, random_state=0)
@@ -437,16 +449,29 @@ def dataframe_demand(
 
 
 def dataframe_fsd50k(
-        dataset_directory: Union[str, os.PathLike] = _root_fsd50k,
+        dataset_directory: Optional[Union[str, os.PathLike]] = None,
 ) -> pd.DataFrame:
     """Creates a Pandas DataFrame with files from the FSD50K corpus.
     Root directory should mimic archive-extracted folder structure.
     Dataset may be downloaded at `<https://www.zenodo.org/record/4060432/>`_.
     """
+    columns = [
+        'fname',
+        'labels',
+        'mids',
+        'split',
+        'filepath',
+        'duration',
+        'sparsity'
+    ]
+    if dataset_directory is None: 
+        return pd.DataFrame(columns=columns)
     dataset_directory = pathlib.Path(dataset_directory)
+    dataset_dataframe = pathlib.Path(ROOT_DIR).joinpath('datasets', 'fsd50k.csv')
     if not dataset_directory.exists():
         raise ValueError(f'{dataset_directory} does not exist.')
-    if not dataset_directory.joinpath('dataframe.csv').exists():
+    if not dataset_dataframe.exists():
+        raise ValueError(f'{dataset_dataframe} does not exist')
 
         # merge separate dev and eval sets into one big table
         df1 = pd.read_csv(next(dataset_directory.rglob('dev.csv')))
@@ -472,13 +497,16 @@ def dataframe_fsd50k(
         if not len(filepaths):
             raise ValueError(f'Could not find any .WAV files within '
                              f'{dataset_directory}.')
-        columns = list(df.columns)
-        df.to_csv(dataset_directory.joinpath('dataframe.csv'),
+        df.to_csv(dataset_dataframe,
                   header=columns,
                   index=False,
                   index_label=False)
     else:
-        df = pd.read_csv(dataset_directory.joinpath('dataframe.csv'))
+        df = pd.read_csv(dataset_dataframe)
+
+    dataset_directory = str(dataset_directory)
+    df = df.sort_values('filepath', ascending=True).reset_index(drop=True)
+    df['filepath'] = df['filepath'].apply(lambda f: os.path.join(dataset_directory, f))
 
     # omit sounds labeled as containing speech or music
     df['labels'] = df['labels'].apply(str.lower)
@@ -507,23 +535,27 @@ def dataframe_fsd50k(
 
 
 def dataframe_musan(
-        dataset_directory: Union[str, os.PathLike] = _root_musan,
+        dataset_directory: Optional[Union[str, os.PathLike]] = None,
 ) -> pd.DataFrame:
     """Creates a Pandas DataFrame with files from the MUSAN corpus.
     Root directory should mimic archive-extracted folder structure.
     Dataset may be downloaded at `<https://www.openslr.org/17/>`_.
     """
+    columns = [
+        'split',
+        'filepath',
+        'duration',
+        'sparsity'
+    ]
+    if dataset_directory is None: 
+        return pd.DataFrame(columns=columns)
     dataset_directory = pathlib.Path(dataset_directory)
+    dataset_dataframe = pathlib.Path(ROOT_DIR).joinpath('datasets', 'musan.csv')
     if not dataset_directory.exists():
         raise ValueError(f'{dataset_directory} does not exist.')
-    if not dataset_directory.joinpath('dataframe.csv').exists():
+    if not dataset_dataframe.exists():
+        raise ValueError(f'{dataset_dataframe} does not exist')
         rows = []
-        columns = [
-            'split',
-            'filepath',
-            'duration',
-            'sparsity'
-        ]
         for filepath in sorted(dataset_directory.rglob('*.wav')):
             is_train = bool('FREE-SOUND' in str(filepath).upper())
             is_test = bool('SOUND-BIBLE' in str(filepath).upper())
@@ -537,12 +569,16 @@ def dataframe_musan(
             raise ValueError(f'Could not find any .WAV files within '
                              f'{dataset_directory}.')
         df = pd.DataFrame(rows, columns=columns)
-        df.to_csv(dataset_directory.joinpath('dataframe.csv'),
+        df.to_csv(dataset_dataframe,
                   header=columns,
                   index=False,
                   index_label=False)
     else:
-        df = pd.read_csv(dataset_directory.joinpath('dataframe.csv'))
+        df = pd.read_csv(dataset_dataframe)
+
+    dataset_directory = str(dataset_directory)
+    df = df.sort_values('filepath', ascending=True).reset_index(drop=True)
+    df['filepath'] = df['filepath'].apply(lambda f: os.path.join(dataset_directory, f))
 
     # omit recordings which are smaller than an example
     df = df.query('duration >= @example_duration')
@@ -569,159 +605,6 @@ def dataframe_musan(
     return df
 
 
-def dataframe_irsurvey(
-        dataset_directory: Union[str, os.PathLike] = _root_irsurvey,
-        empty: bool = False,
-) -> pd.DataFrame:
-    """Creates a Pandas DataFrame with files from the MIT Acoustical
-    Reverberation Scene Statistics Survey. Root directory should mimic
-    archive-extracted folder structure. Dataset may be downloaded at
-    `<https://mcdermottlab.mit.edu/Reverb/IR_Survey.html>`_.
-    """
-    if empty:
-        return pd.DataFrame(columns=['filepath', 'split', 'duration', 'frequency'])
-    rows = []
-    files = sorted(pathlib.Path(dataset_directory).glob('*.wav'))
-    if not len(files) == 270:
-        raise ValueError(f'Audio files missing, check {dataset_directory}.')
-
-    for filepath in files:
-        ir_name = ''.join(filepath.name.split('_')[1:-1])
-        ir_duration = wav_read(filepath)[1]
-        if filepath.name == 'h053_Office_ConferenceRoom_stxts.wav':
-            ir_frequency = 3
-        else:
-            try:
-                ir_frequency = int(
-                    filepath.name.split('txt')[0].split('_')[-1])
-            except (Exception,):
-                ir_frequency = 1
-        rows += [(ir_name, ir_frequency, ir_duration, str(filepath))]
-
-    df = pd.DataFrame(
-        rows, columns=['name', 'frequency', 'duration', 'filepath'])
-
-    # shuffle the recordings
-    df = df.sample(frac=1, random_state=200).reset_index(drop=True)
-
-    # organize by split
-    df['split'] = 'train'
-    df.loc[int(270 * .8):int(270 * .9), 'split'] = 'val'
-    df.loc[int(270 * .9):, 'split'] = 'test'
-
-    # ensure that all the audio files exist
-    if not all([f for f in df.filepath if os.path.isfile(f)]):
-        raise ValueError(f'Audio files missing, check {dataset_directory}.')
-
-    # reindex and name the dataframe
-    df = df[['filepath', 'split', 'duration', 'frequency']]
-    df = df.reset_index(drop=True)
-    df.index.name = 'IR_SURVEY'
-    return df
-
-
-def dataframe_slr28(
-        dataset_directory: Union[str, os.PathLike] = _root_slr28,
-        empty: bool = False,
-) -> pd.DataFrame:
-    """Creates a Pandas DataFrame with files from the 2017 ICASSP paper,
-    "A Study on Data Augmentation of Reverberant Speech for Robust Speech
-    Recognition". Root directory should mimic archive-extracted folder
-    structure. Dataset may be downloaded at `<https://www.openslr.org/28/>`_.
-    """
-    if empty:
-        return pd.DataFrame(columns=['type', 'id', 'room', 'filepath'])
-    def parse_rir_list(filepath: str, real: bool = False):
-        sublist = []
-        fp = pathlib.Path(filepath)
-        if not fp.exists():
-            fp = pathlib.Path(dataset_directory).joinpath(fp)
-            if not fp.exists():
-                raise IOError(f'Missing rir_list {str(fp)}.')
-        i_type = 'real' if real else 'simulated'
-        for line in open(fp).read().splitlines():
-            parts = line.split()
-            i_id, i_room = str(parts[1]), str(parts[3])
-            i_filepath = pathlib.Path(dataset_directory).joinpath(
-                str(parts[4]).replace('RIRS_NOISES/', '')
-            )
-            if not i_filepath.exists():
-                raise IOError(f'Missing file {i_filepath}.')
-            sublist.append((i_type, i_id, i_room, str(i_filepath)))
-        return sublist
-
-    # add the real impulse responses
-    rows = parse_rir_list('real_rirs_isotropic_noises/rir_list', real=True)
-    df_real = pd.DataFrame(
-        rows, columns=['type', 'id', 'room', 'filepath'])
-
-    # shuffle the recordings
-    df_real = df_real.sample(
-        frac=1, random_state=0).reset_index(drop=True)
-    nrows = len(df_real)
-
-    # organize by split
-    df_real['split'] = 'train'
-    df_real.loc[int(nrows * .8):int(nrows * .9), 'split'] = 'val'
-    df_real.loc[int(nrows * .9):, 'split'] = 'test'
-
-    # add the synthetic impulse responses
-    rows = []
-    rows += parse_rir_list('simulated_rirs/smallroom/rir_list')
-    rows += parse_rir_list('simulated_rirs/mediumroom/rir_list')
-    rows += parse_rir_list('simulated_rirs/largeroom/rir_list')
-    df_synth = pd.DataFrame(
-        rows, columns=['type', 'id', 'room', 'filepath'])
-
-    # shuffle the recordings
-    df_synth = df_synth.sample(
-        frac=1, random_state=0).reset_index(drop=True)
-    nrows = len(df_synth)
-
-    # organize by split
-    df_synth['split'] = 'train'
-    df_synth.loc[int(nrows * .8):int(nrows * .9), 'split'] = 'val'
-    df_synth.loc[int(nrows * .9):, 'split'] = 'test'
-
-    # combine real and synthetic
-    df = pd.concat((df_real, df_synth))
-
-    # reindex and name the dataframe
-    df = df.reset_index(drop=True)
-    df.index.name = 'SLR28'
-    return df
-
-
-def split_speakers(
-        only_tc100: bool = True
-) -> Tuple[List, List, List]:
-    """Splits LibriSpeech speaker IDs into train, validation, and test sets.
-    """
-    df = df_librispeech
-    root = pathlib.Path(__file__).absolute().parent
-    speakers_vl = pd.read_csv(str(root.joinpath('speakers/validation.csv')))
-    speakers_te = pd.read_csv(str(root.joinpath('speakers/test.csv')))
-    speakers_tr = df['subset_id'].str.contains('train-clean-100')
-    if not only_tc100:
-        # will use speakers from both the 100hr and 360hr set
-        speakers_tr = df['subset_id'].str.contains('train-clean')
-    sp_ids_vl = set(speakers_vl['speaker_id'])
-    sp_ids_te = set(speakers_te['speaker_id'])
-    sp_ids_tr = set(df[speakers_tr]['speaker_id'])
-    sp_ids_tr -= sp_ids_vl
-    sp_ids_tr -= sp_ids_te
-    return sorted(sp_ids_tr), sorted(sp_ids_vl), sorted(sp_ids_te)
-
-
-def get_noise_corpus(name: str):
-    """Returns a noise corpus DataFrame by name."""
-    return {
-        'musan': df_musan,
-        'fsd50k': df_fsd50k,
-        'demand': df_demand,
-    }.get(name.lower())
-
-
 class Mixtures:
     """Dataset for noisy speech signals.
     """
@@ -729,13 +612,14 @@ class Mixtures:
     def __init__(
             self,
             speaker_id_or_ids: Union[int, Sequence[int]],
+            folder_librispeech: Optional[str] = None,
+            folder_fsd50k: Optional[str] = None,
+            folder_musan: Optional[str] = None,
             split_speech: Optional[str] = 'all',
             split_premixture: Optional[str] = 'train',
             split_mixture: Optional[str] = 'train',
             split_reverb: Optional[str] = None,
             frac_speech: Optional[float] = 1.,
-            corpus_premixture: str = 'fsd50k',
-            corpus_mixture: str = 'musan',
             snr_premixture: Optional[Union[float, Tuple[float, float]]] = None,
             snr_mixture: Optional[Union[float, Tuple[float, float]]] = None,
             dataset_duration: Union[int, float] = 0
@@ -747,20 +631,10 @@ class Mixtures:
             raise ValueError('Expected one or a sequence of speaker IDs.')
         if len(speaker_id_or_ids) < 1:
             raise ValueError('Expected one or more speaker IDs.')
-        if not set(speaker_id_or_ids).issubset(set(speaker_ids_all)):
-            raise ValueError('Invalid speaker IDs, not found in LibriSpeech.')
         self.speaker_ids = speaker_id_or_ids
         self.frac_speech = frac_speech
         self.speaker_ids_repr = repr(self.speaker_ids)
-        if set(self.speaker_ids) == set(speaker_ids_tr):
-            self.speaker_ids_repr = 'speaker_ids_tr'
-        elif set(self.speaker_ids) == set(speaker_ids_vl):
-            self.speaker_ids_repr = 'speaker_ids_vl'
-        elif set(self.speaker_ids) == set(speaker_ids_te):
-            self.speaker_ids_repr = 'speaker_ids_te'
-        elif set(self.speaker_ids) == set(speaker_ids_all):
-            self.speaker_ids_repr = 'speaker_ids_all'
-
+        
         # missing pairs of arguments
         if not split_premixture:
             if snr_premixture is not None:
@@ -830,21 +704,11 @@ class Mixtures:
         self.example_duration = example_duration
 
         # instantiate corpora
-        self.corpus_s = df_librispeech.query(
-            f'speaker_id in {self.speaker_ids}')
-        if self.split_speech != 'all':
-            self.corpus_s = self.corpus_s.query(
-                f'split == "{self.split_speech}"')
-        if 0 < self.frac_speech < 1:
-            self.corpus_s = self.corpus_s.sample(
-                frac=frac_speech, random_state=0)
-            print('Length of subsampled dataset:', len(self.corpus_s))
-        self.corpus_m = get_noise_corpus(corpus_premixture).query(
-            f'split == "{self.split_premixture}"')
-        self.corpus_n = get_noise_corpus(corpus_mixture).query(
-            f'split == "{self.split_mixture}"')
-        self.corpus_r = df_irsurvey.query(
-            f'split == "{self.split_reverb}"')
+        self.instantiate_corpora(
+            folder_librispeech,
+            folder_fsd50k,
+            folder_musan,
+        )
 
         # calculate maximum random offset for all utterances
         max_offset_func = lambda d: d.assign(max_offset=(
@@ -887,6 +751,29 @@ class Mixtures:
         if self.dataset_duration and self.add_premixture_noise:
             raise ExperimentError('Fine-tuning dataset contains '
                                   'premixture noise.')
+
+    def instantiate_corpora(self, folder_librispeech, folder_fsd50k, folder_musan):
+        
+        self.corpus_s = dataframe_librispeech(folder_librispeech).query(
+            f'speaker_id in {self.speaker_ids}')
+        if self.split_speech != 'all':
+            self.corpus_s = self.corpus_s.query(
+                f'split == "{self.split_speech}"')
+        if 0 < self.frac_speech < 1:
+            self.corpus_s = self.corpus_s.sample(
+                frac=self.frac_speech, random_state=0)
+            print('Length of subsampled dataset:', len(self.corpus_s))
+        
+        self.corpus_m = dataframe_fsd50k(folder_fsd50k).query(
+            f'split == "{self.split_premixture}"')
+        
+        self.corpus_n = dataframe_musan(folder_musan).query(
+            f'split == "{self.split_mixture}"')
+
+        self.corpus_r = pd.DataFrame()  # disable support for reverb
+        # self.corpus_r = df_irsurvey.query(
+        #     f'split == "{self.split_reverb}"')
+        return
 
     def __dict__(self):
         return {
@@ -1096,26 +983,3 @@ class ContrastiveMixtures(Mixtures):
             pre_snrs=torch.cuda.FloatTensor(bpre_snrs),
             post_snrs=torch.cuda.FloatTensor(bpost_snrs)
         )
-
-
-# expose corpora and speaker lists
-df_librispeech = dataframe_librispeech()
-df_musan = dataframe_musan()
-df_fsd50k = dataframe_fsd50k()
-df_demand = dataframe_demand(empty=True)
-df_irsurvey = dataframe_irsurvey(empty=True)
-df_slr28 = dataframe_slr28(empty=True)
-speaker_ids_tr, speaker_ids_vl, speaker_ids_te = split_speakers(False)
-speaker_ids_all = speaker_ids_tr + speaker_ids_vl + speaker_ids_te
-speaker_split_durations = df_librispeech.groupby(
-    ['speaker_id', 'split']).agg('sum').duration
-
-# expose test sets
-data_te_generalist: Mixtures = Mixtures(
-    speaker_ids_te, 'test', split_mixture='test', snr_mixture=(-5, 5)
-)
-data_te_specialist: List[Mixtures] = [
-    Mixtures(speaker_id, 'test', corpus_mixture='fsd50k',
-             split_mixture='test', snr_mixture=(-5, 5))
-    for speaker_id in speaker_ids_te
-]

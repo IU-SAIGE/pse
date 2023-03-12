@@ -9,8 +9,7 @@ import torch
 import torch.nn.functional as tf
 from torch.nn.modules.loss import _Loss
 
-from exp_data import Mixtures, sample_rate, sisdr_improvement, \
-    data_te_generalist, sdr, sisdr, wav_write
+from exp_data import Mixtures, sample_rate, sisdr_improvement, sdr, sisdr, wav_write
 from exp_utils import make_2d, make_3d, pad_x_to_y, shape_reconstructed
 
 
@@ -660,7 +659,7 @@ def test_denoiser_with_speaker(
 @torch.no_grad()
 def test_denoiser_from_module(
         model: torch.nn.Module,
-        data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
+        data_te: Union[Mixtures, Sequence[Mixtures]],
         accumulation: bool = False
 ) -> dict:
     """Evaluates speech enhancement model using provided dataset.
@@ -683,7 +682,7 @@ def test_denoiser_from_module(
 @torch.no_grad()
 def test_denoiser_from_file(
         checkpoint_path: Union[str, os.PathLike],
-        data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
+        data_te: Union[Mixtures, Sequence[Mixtures]],
         accumulation: bool = False
 ) -> dict:
     """Evaluates speech enhancement model checkpoint using provided dataset.
@@ -711,7 +710,7 @@ def test_denoiser_from_file(
 @torch.no_grad()
 def test_denoiser_from_folder(
         checkpoint_folder: Union[str, os.PathLike],
-        data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
+        data_te: Union[Mixtures, Sequence[Mixtures]],
         accumulation: bool = False,
         finetune: int = 0,
         use_last: bool = False
@@ -744,7 +743,7 @@ def test_denoiser_from_folder(
 @torch.no_grad()
 def test_denoiser(
         model: Union[str, os.PathLike, torch.nn.Module],
-        data_te: Union[Mixtures, Sequence[Mixtures]] = data_te_generalist,
+        data_te: Union[Mixtures, Sequence[Mixtures]],
         accumulation: bool = False,
         finetune: int = 0,
         use_last: bool = False
