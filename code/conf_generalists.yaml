@@ -1,15 +1,11 @@
 # This YAML configuration file defines the generalists experiment search space.
 # All values provided in a list expand the search space.
 #
-# For example, if model_name is ["convtasnet", "grunet"] and speaker_id is
-# [19, 26, 39], then there are six experiments total. As another example, if
-# model_name and speaker_id are defined as before, and use_loss_contrastive is
-# [False, True] and use_loss_purification is [False, True], then there would
-# be twenty-four experiments total to run.
-#
-# Most importantly, the speaker_id value designates the personalization target;
-# the self-supervised models are trained using already-noisy single-speaker
-# observations (e.g., 19 + FSD50K, 26 + FSD50K).
+# For example, if model_name is ["convtasnet", "grunet"] and batch_size is
+# [32, 64, 128], then there are six experiments total. As another example, if
+# model_name and batch_size are defined as before, and distance_func is
+# [0.001, 0.01, 0.1] and distance_func is ['snr', 'mse'], then there would
+# be thirty-six experiments total to run.
 
 # -----------------------------------------------------------------------------
 # ray configuration

@@ -28,18 +28,38 @@ This work presents self-supervised learning (SSL) methods for developing monaura
 
 Note that DP may be applied onto the loss functions of either PseudoSE or CM.
 
+## Installation & Usage
 
-## Required Python Packages
+Use pip to install the necessary Python packages (e.g., [pytorch-lightning](https://pytorch-lightning.readthedocs.io/en/stable/), [ray[tune]](https://docs.ray.io/en/latest/tune/), and [asteroid](https://asteroid-team.github.io/)).
 
 ```
-asteroid>=0.4.5
-numpy>=1.19.5
-pandas>=1.1.5
-PyYAML>=6.0
-ray>=1.1.0
-SoundFile>=0.10.3.post1
-torch>=1.8.2+cu111
+pip install -r requirements.txt
 ```
+
+Additionally, the following datasets must be downloaded and un-zipped:
++ [Librispeech](http://www.openslr.org/12/)
++ [FSD50K](https://zenodo.org/record/4060432)
++ [MUSAN](http://www.openslr.org/17/)
+
+We define a _generalist_ model as one which is speaker-agnostic; it is trained to enhance the voices of many different speakers. A _specialist_ model is one which is trained to enhance the voice of a single speaker. In this experiment, we train specialist models entirely using degraded recordings (sampling a single speaker from **Librispeech** and unseen noises from **FSD50K**).
+
+To train generalist models, first modify `code/conf_generalists.yaml` with the correct folder paths, then run:
+```
+python code/train_generalists.py
+```
+Similarly, to train specialist models, first modify `code/conf_specialists.yaml` with the correct folder paths, then run:
+```
+python code/train_specialists.py
+```
+
+Each YAML configuration file defines the experiment search space, and all values provided in a list expand the search space. For example, the provided `conf_generalists.yaml` will run four different experiments:
+
+1. *{batch_size=64, model_name=convtasnet, model_size=tiny, distance_func=snr}*
+2. *{batch_size=64, model_name=convtasnet, model_size=small, distance_func=snr}*
+3. *{batch_size=64, model_name=convtasnet, model_size=medium, distance_func=snr}*
+4. *{batch_size=64, model_name=convtasnet, model_size=large, distance_func=snr}*
+
+The experiments may be run across multiple GPUs and CPUs, which can be specified in the above YAML files.
 
 ## Citation
 
